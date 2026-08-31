@@ -259,11 +259,9 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
         // When bypassPermissions is true (full_access profile), skip permission wrapping entirely.
         let tools: import('ai').ToolSet;
         let toolSystemPrompts: string[] = [];
-        // Captured so the manual-authority dispatch path below (for tools in
-        // MANUAL_AUTHORITY_TOOLS, e.g. codepilot_cli_tools_install) can reuse
-        // the EXACT SAME permission context resolveToolPermission() needs —
-        // not a reconstructed/duplicated one. undefined in bypass mode,
-        // matching assembleTools()'s own bypassPermissions handling exactly.
+        // Shared with the manual-authority dispatch path below (e.g.
+        // codepilot_cli_tools_install) so resolveToolPermission() there uses
+        // the exact same context, never a reconstructed one.
         const toolPermissionContext = bypassPermissions ? undefined : {
           sessionId,
           permissionMode: (permissionMode || 'normal') as PermissionMode,
@@ -302,36 +300,19 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
           toolSystemPrompts = assembled.systemPrompts;
         }
 
-        // Execution-integrity boundary for codepilot_cli_tools_install ONLY.
-        // This tool executes an arbitrary shell command built from
-        // model-generated text — the one tool in this set where "the model
-        // asked for it and the JSON parsed" is not sufficient proof of safe
-        // intent. An AI SDK provider adapter's separately-projected final
-        // tool-call input can diverge from what was actually streamed, even
-        // under a safe finish reason and even when the JSON is schema-valid
-        // (reproduced directly against the real @ai-sdk/openai adapter).
-        // createAiSdkExecutionLock removes execute/onInputStart/
-        // onInputDelta/onInputAvailable so nothing in this process can run
-        // it before the per-step guard below reaches a decision from
-        // SDK-emitted tool-input-delta evidence. Every other tool in
-        // `tools` is unaffected —
-        // this branch only fires if the key is actually present (e.g. not
-        // mounted at all in a permission profile that excludes cli-tools).
+        // codepilot_cli_tools_install is execution-locked via
+        // prefix-safe-json's createAiSdkExecutionLock, so nothing here can
+        // run it before the guard below grants authority from streamed
+        // tool-input-delta evidence. Every other tool is unaffected.
         if (tools.codepilot_cli_tools_install) {
-          // Dynamic import: prefix-safe-json is ESM-only; static import
-          // cannot be resolved from a .ts source file under this project's
-          // moduleResolution:"bundler" + tsx test harness combination. This
-          // runs once per agent-loop invocation, not per token.
+          // Dynamic import: prefix-safe-json is ESM-only, unresolvable via a
+          // static import under this project's moduleResolution:"bundler" +
+          // tsx combination. Runs once per invocation, not per token.
           const { createAiSdkExecutionLock } = await import('prefix-safe-json');
-          // `ToolSet`'s index signature widens every tool's own generic
-          // input-schema type to `FlexibleSchema<never>` for storage; the
-          // lock preserves the specific type it was actually given, which
-          // TypeScript can no longer prove satisfies that widened slot when
-          // merged back in — even though this is exactly the same tool
-          // object, unchanged in every field this cast doesn't touch.
-          // Runtime-correct, proven by the accompanying real-lifecycle
-          // tests (which import and execute this exact tool through this
-          // exact call), not a type suppressed to paper over a real gap.
+          // Double-cast below: ToolSet's index signature widens each tool's
+          // schema type to FlexibleSchema<never> for storage, which the lock's
+          // preserved specific type can no longer be proven to satisfy — the
+          // object itself is unchanged; runtime-correct per the lifecycle tests.
           const lockedInstallTool = createAiSdkExecutionLock({
             codepilot_cli_tools_install: tools.codepilot_cli_tools_install,
           }) as unknown as { codepilot_cli_tools_install: import('ai').ToolSet[string] };
@@ -632,12 +613,10 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
           // provider request (cleared by the fullStream observer below).
           timeoutCtl.onStepRequest();
 
-          // Fresh execution guard per step. Fed every fullStream event
-          // below (unfiltered — filtering evidence to make the guard
-          // approve would defeat the point) and resolved once this step's
-          // stream is fully consumed and finishReason is known. Only
-          // relevant to codepilot_cli_tools_install (the only locked
-          // tool); harmless no-op bookkeeping for every other event.
+          // Fresh guard per step, fed every fullStream event unfiltered
+          // below (filtering evidence to make it approve would defeat the
+          // point). Only codepilot_cli_tools_install ever consumes its
+          // decisions; a no-op for every other tool's events.
           const stepGuard = (await import('prefix-safe-json')).createAiSdkExecutionGuard();
 
           // Call streamText (single step — we control the loop)
@@ -725,34 +704,17 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
           let hasToolCalls = false;
           let hasContent = false; // tracks whether any actual content was produced
           const stepToolNames: string[] = [];
-          // Every codepilot_cli_tools_install toolCallId actually observed
-          // on the stream this step, independent of whether PSJ's guard
-          // ever produces a decision for it. A call with zero corroborating
-          // tool-input-delta evidence gets ZERO guard decisions (not even a
-          // 'reject' one — proven directly by the execution-authority
-          // suite's own CASE F), so the manual-dispatch loop below must
-          // reconcile against THIS set, not just iterate guardDecisions,
-          // or a no-evidence call silently gets no tool-result at all from
-          // this dispatch path — leaving its tool-call dangling until some
-          // later, generic repair mechanism papers over it, which is a
-          // different guarantee than the explicit fail-closed result this
-          // file's own dispatch is supposed to produce.
+          // Every install toolCallId actually observed on the stream, tracked
+          // independent of the guard's own decisions: a call with zero
+          // corroborating tool-input-delta evidence gets ZERO guard decisions
+          // (not even a reject — see CASE F), so the dispatch loop below must
+          // reconcile against this observed set, not just iterate decisions,
+          // or such a call would silently get no tool-result at all.
           const observedInstallToolCallIds = new Set<string>();
-          // The SDK's own separately-projected terminal input for each
-          // observed install call — captured ONLY as a consistency witness,
-          // never as a value this dispatch ever executes or requests
-          // permission for. Real @ai-sdk/openai adapter, proven directly:
-          // `response.function_call_arguments.done`'s `arguments` field is
-          // an independently-sourced field the adapter never reconciles
-          // against the tool-input-delta stream — it can be a COMPLETE,
-          // schema-valid, but entirely DIFFERENT command than what was
-          // actually streamed and than what authority.value (below) will
-          // be. This is what agent-loop's own `tool_use` SSE event and
-          // ai-sdk's own `response.messages` history both display —
-          // meaning a caller trusting authority.value alone for EXECUTION
-          // while this diverges is executing one command while showing the
-          // user and the model's own history a DIFFERENT one. Reconciled
-          // against authority.value below, before permission or dispatch.
+          // SDK-projected terminal input per observed call — witness only,
+          // never dispatched or used for permission. Some adapters diverge
+          // from the streamed tool-input-delta evidence; compared against
+          // authority.value below, before dispatch.
           const sdkProjectedInputByToolCallId = new Map<string, unknown>();
           let externalSources: ExternalSource[] = [];
           const providerSearchResults = new Map<string, {
@@ -920,50 +882,25 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
             }
           }
 
-          // Step's stream is fully consumed, but timeoutCtl.onStepEnd() is
-          // deliberately NOT called yet: it unconditionally clears every
-          // per-tool timer, including the one armed for
-          // codepilot_cli_tools_install's own `tool-call` part above (see
-          // toolTimers in native-timeout.ts). That call's real work —
-          // authority, permission wait, shell execution — all happens
-          // below, AFTER the stream loop exits. Clearing here would let
-          // toolExecutionMs stop covering the one tool it names explicitly
-          // in its own semantic contract (native-timeout.ts's "for
-          // permission-gated tools the in-execute approval wait counts
-          // toward this budget"). onStepEnd() instead runs once, after
-          // every decision below has reached its own terminal outcome —
-          // each of which clears its OWN timer individually first (see
-          // the onStreamPart('tool-result') call in the loop below), so
-          // onStepEnd() here is just the same step-boundary safety net it
-          // always was, never the FIRST clear for this tool's timer.
+          // timeoutCtl.onStepEnd() is deliberately deferred: it clears every
+          // per-tool timer, but codepilot_cli_tools_install's real work
+          // (authority, permission wait, shell execution) all happens below.
+          // Runs once every decision reaches its own terminal outcome and
+          // clears its own timer (native-timeout.ts's toolExecutionMs
+          // contract).
           //
-          // Resolve authority for codepilot_cli_tools_install, if it was
-          // called this step. Every other tool already ran natively above
-          // (real execute(), real tool-result already in the fullStream) —
-          // this block only ever matches decisions for the one locked tool.
-          // Because the tool has no execute callback, a valid call cannot
-          // have produced a native SDK tool-result before this point —
-          // confirmed empirically by the execution-authority lifecycle
-          // tests, not assumed. Fail closed: no authority, no dispatch.
+          // Resolve authority for codepilot_cli_tools_install, if called
+          // this step. No execute() means no native tool-result could exist
+          // yet; fail closed: no authority, no dispatch.
           const stepFinishReasonForGuard = await result.finishReason;
           const { decisions: guardDecisions } = stepGuard.finish({
             providerReason: String(stepFinishReasonForGuard),
           });
           const installResultMessages: ModelMessage[] = [];
-          // Reconcile against every OBSERVED install toolCallId (tracked
-          // above, from the raw stream), not just whatever guardDecisions
-          // happens to contain. A call with zero corroborating
-          // tool-input-delta evidence produces ZERO guard decisions — not
-          // even an explicit 'reject' one, proven directly by the
-          // execution-authority suite's own "no tool-input-delta evidence"
-          // case — so iterating guardDecisions alone would silently skip
-          // it: no tool-result from this dispatch path at all, leaving its
-          // tool-call dangling until some later, generic history-repair
-          // mechanism papers over it with a different, less specific
-          // message. Building this lookup once, then iterating the
-          // observed set, guarantees every install call this step reaches
-          // exactly one explicit outcome here — success, explicit reject,
-          // or explicit no-decision — never silence.
+          // Reconciled against observedInstallToolCallIds below (see that
+          // declaration above), not iterated from guardDecisions alone —
+          // guaranteeing every install call reaches exactly one explicit
+          // outcome: success, explicit reject, or explicit no-decision.
           const installDecisionsById = new Map(
             guardDecisions
               .filter((d) => d.name === 'codepilot_cli_tools_install' && d.toolCallId)
@@ -987,27 +924,15 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
                 isError = true;
               } else {
                 const parsedInput = CLI_TOOL_INSTALL_SCHEMA.safeParse(authority.value);
-                // Consistency witness check: does the SDK's own separately-
-                // projected terminal input for this toolCallId (captured
-                // above, purely as a witness — never dispatched, never
-                // requested for permission) structurally agree with
-                // authority.value? Proven directly against the real
-                // @ai-sdk/openai adapter that these CAN diverge — both
-                // complete, both schema-valid, genuinely different commands
-                // — because response.function_call_arguments.done's
-                // `arguments` field is independently sourced, never
-                // reconciled against the delta stream by the adapter. When
-                // they diverge, agent-loop's own `tool_use` SSE event and
-                // ai-sdk's own `response.messages` history both display the
-                // SDK's projection (B), not authority.value (A) — so
-                // dispatching A here regardless would execute a DIFFERENT
-                // command than the one shown to the user and recorded in
-                // the model's own history. Neither value is trustworthy
-                // once they disagree — this blocks entirely rather than
-                // picking one. isDeepStrictEqual: structural, property-
-                // order-independent — never a stringify-and-compare, which
-                // would false-positive on two semantically-identical
-                // objects serialized with different key order.
+                // Consistency witness check: authority.value (A) must
+                // structurally agree with the SDK's separately-projected
+                // terminal input (B, witness-only, never dispatched). Some
+                // adapters can produce complete, schema-valid A/B that
+                // genuinely differ — and the SSE tool_use event / response
+                // history both display B, not A, so dispatching A regardless
+                // would run a different command than what's shown/recorded.
+                // Block entirely on disagreement; isDeepStrictEqual is a
+                // structural compare, never stringify-and-compare.
                 const sdkProjectedInput = sdkProjectedInputByToolCallId.get(toolCallId);
                 const projectedInputDiverges = parsedInput.success && !isDeepStrictEqual(authority.value, sdkProjectedInput);
                 if (!parsedInput.success) {
@@ -1018,60 +943,36 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
                   outcomeText = 'Installation blocked: the authorized value did not match the expected install-tool shape.';
                   isError = true;
                 } else if (projectedInputDiverges) {
-                  // Permission is NEVER requested and the shell is NEVER
-                  // dispatched for this call — not with authority.value,
-                  // not with the SDK's projection. One explicit, terminal,
-                  // fail-closed tool-result, same as every other blocked
-                  // branch here, so the next-step history stays valid.
+                  // Divergence found above: permission 0, shell 0 — one
+                  // explicit fail-closed tool-result, same as every other
+                  // blocked branch, so the next-step history stays valid.
                   outcomeText = 'Installation blocked: the execution-authority value and the SDK-projected tool-call input for this call disagree — the surrounding response is internally inconsistent, so neither value is dispatched.';
                   isError = true;
                 } else if (!toolPermissionContext) {
-                  // full_access / bypassPermissions: same as every other
-                  // tool under this profile — no permission prompt,
-                  // dispatch directly. THE non-negotiable invariant still
-                  // holds: this value is authority.value, never an
-                  // execute() argument, step.toolCalls[].input/args, or
-                  // SDK-projected input. `signal: timeoutCtl.signal` is
-                  // the SAME combined signal (fired budget OR caller
-                  // abort) used everywhere else in this run — runCliToolInstall
-                  // throws a real AbortError instead of swallowing it if
-                  // this fires mid-execution, which propagates out of this
-                  // whole block uncaught, exactly like any other run
-                  // failure, so the outer catch's existing
-                  // timeoutCtl.fired-based classification runs unchanged.
+                  // full_access / bypassPermissions: no permission prompt,
+                  // dispatch directly — still authority.value, never any
+                  // SDK-projected input. The shared timeoutCtl.signal means
+                  // a fired budget/abort mid-execution throws a real
+                  // AbortError here, propagating uncaught to the outer catch's
+                  // existing classification, same as any other run failure.
                   outcomeText = await runCliToolInstall(parsedInput.data, { signal: timeoutCtl.signal });
                   isError = false;
                 } else {
-                  // codepilot_cli_tools_install is deliberately excluded
-                  // from wrapWithPermissions's generic execute-wrapping
-                  // (see MANUAL_AUTHORITY_TOOLS in agent-tools.ts) — it
-                  // has no execute() for that wrapper to wrap. The SAME
-                  // permission decision (checkPermission -> ask ->
-                  // allow/deny/updatedInput -> session approval) is made
+                  // codepilot_cli_tools_install has no execute() for
+                  // wrapWithPermissions to wrap (MANUAL_AUTHORITY_TOOLS in
+                  // agent-tools.ts), so the same permission decision is made
                   // here instead, via the identical resolveToolPermission()
-                  // the wrapper calls for every other mutating tool — one
-                  // implementation, two call sites, never duplicated.
+                  // every other mutating tool's wrapper also calls.
                   const permission = await resolveToolPermission(
                     'codepilot_cli_tools_install',
                     parsedInput.data,
                     toolPermissionContext,
                   );
-                  // resolveToolPermission's own abort handling (shared
-                  // with every other tool's permission wait, via
-                  // permission-registry's registerPendingPermission)
-                  // RESOLVES as an ordinary deny when its abortSignal
-                  // fires — it never throws, by design, so every other
-                  // caller can keep treating "the wait was interrupted"
-                  // as a plain deny. That design is correct for
-                  // natively-executed tools (their OWN tool-result still
-                  // flows back through the fullStream, which guardStream
-                  // already races against a fired budget independently).
-                  // This manual path has no such independent race: past
-                  // this point nothing else is watching timeoutCtl.signal
-                  // for THIS call, so a deny caused by that same signal
-                  // having fired must be promoted to a real throw here —
-                  // never silently reported as an ordinary user denial
-                  // while the run continues to the next step as normal.
+                  // resolveToolPermission() resolves an aborted wait as an
+                  // ordinary deny by design — correct for natively-executed
+                  // tools (guardStream races independently), but this manual
+                  // path has no such race, so a deny caused by the shared
+                  // signal firing must be promoted to a real throw here.
                   if (timeoutCtl.signal.aborted) {
                     const waitAbortErr = new Error(
                       timeoutCtl.fired
@@ -1085,14 +986,10 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
                     outcomeText = permission.message ?? 'Permission denied';
                     isError = true;
                   } else {
-                    // permission.input equals authority.value UNLESS the
-                    // user explicitly edited it during approval
-                    // (updatedInput) — that explicit, human-approved edit
-                    // is the only way the dispatched value may ever differ
-                    // from authority.value. Re-validate with the same
-                    // schema PSJ's own authority already satisfied:
-                    // updatedInput arrives through a separate API/DB
-                    // boundary and must never reach the shell unchecked.
+                    // permission.input == authority.value unless the user
+                    // explicitly edited it during approval — the only
+                    // permitted dispatch divergence, and re-validated with
+                    // the same schema before it can reach the shell.
                     const revalidated = CLI_TOOL_INSTALL_SCHEMA.safeParse(permission.input);
                     if (!revalidated.success) {
                       outcomeText = 'Installation blocked: the user-approved input did not match the expected install-tool shape.';
@@ -1105,42 +1002,24 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
                 }
               }
             } else if (decision) {
-              // An explicit reject decision: append an explicit skipped
-              // tool-result rather than silently dropping it or aborting
-              // the whole step. Every tool_use requires a matching
-              // tool_result for the next model call's message history to
-              // remain valid (both OpenAI's and Anthropic's APIs reject a
-              // dangling tool_use) — and terminating the step outright
-              // would also discard any other tool calls or text the model
-              // produced in the same step. This mirrors how `tool-error`
-              // is already surfaced elsewhere in this same loop (line
-              // ~774 below): an is_error:true tool_result, not silence.
+              // Explicit reject: an explicit skipped tool-result, not a
+              // dropped one — every tool_use needs a matching tool_result
+              // for the next step's message history to stay valid.
               outcomeText = `Installation skipped: the surrounding response was not confirmed safe to execute (${decision.reason ?? 'no positive authority'}).`;
               isError = true;
             } else {
-              // No decision at all — not even an explicit reject. This is
-              // the "no tool-input-delta evidence" case: the SDK still
-              // emitted a terminal tool-call part, but nothing corroborates
-              // it, so the guard never produces a decision to look up.
-              // Distinct message from the reject branch above (there's no
-              // decision.reason to report), but the same fail-closed
-              // guarantee: never falls back to the SDK-projected input,
-              // never silently drops the call.
+              // No decision at all (see observedInstallToolCallIds above) —
+              // same fail-closed guarantee, distinct message since there's
+              // no decision.reason to report.
               outcomeText = 'Installation blocked: no execution-authority decision was ever produced for this call — no corroborating tool-input-delta evidence was observed on the stream.';
               isError = true;
             }
 
-            // This decision has reached ITS OWN terminal outcome — success,
-            // permission deny, PSJ reject, or schema reject — so clear ITS
-            // toolCallId's own timer now, the same way a native tool's
-            // timer is cleared by its own real tool-result part on the
-            // stream above. onStreamPart keys strictly by toolCallId (see
-            // native-timeout.ts), so this can never clear a DIFFERENT
-            // decision's still-pending timer in the same step (two
-            // simultaneous installs stay independent). A signal-aborted
-            // runCliToolInstall/resolveToolPermission above already threw
-            // past this line entirely, so this only ever runs for a
-            // genuine terminal result, never papering over an abort.
+            // This decision reached its own terminal outcome — clear only
+            // its own toolCallId's timer (keys strictly by toolCallId, so
+            // two simultaneous installs stay independent). A signal-aborted
+            // call above already threw past this line, so this never papers
+            // over an abort.
             timeoutCtl.onStreamPart({ type: 'tool-result', toolCallId });
 
             toolInvocationAccumulator.recordToolResult(toolCallId, outcomeText);
@@ -1159,13 +1038,8 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
             } as ModelMessage);
           }
 
-          // Every decision above (if any) has now reached its own terminal
-          // outcome and cleared its own timer individually. This is the
-          // step-boundary safety net it always was — connect/first-token
-          // plus any tool timer that, for some other reason, never got an
-          // individual clear — never the FIRST clear for
-          // codepilot_cli_tools_install's timer (see the long comment
-          // where this call used to sit, right after the stream loop).
+          // Runs once, after every install decision above has cleared its
+          // own timer (see the deferral note above the reconciliation loop).
           timeoutCtl.onStepEnd();
 
           // AI SDK's response metadata is the Runtime/Provider fact for the
@@ -1229,10 +1103,9 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
           // Update messages for next iteration.
           // streamText returns the full message list including our input + model response.
           // Use response.messages which contains properly typed ModelMessage[].
-          // installResultMessages (built above) are appended after — the
-          // locked install tool has no native execute, so responseData.messages
-          // never contains a tool-result for it; this is where that missing
-          // message gets synthesized from scratch, not a placeholder-replace.
+          // installResultMessages (built above): the locked tool has no
+          // native execute, so responseData.messages never contains its
+          // tool-result — synthesized here instead of a placeholder-replace.
           messages = [...messages, ...responseData.messages, ...installResultMessages] as ModelMessage[];
         }
 

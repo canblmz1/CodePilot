@@ -3,14 +3,15 @@
  *
  * Real, unmodified @ai-sdk/openai (this repo's own pinned ^4.0.5) driven
  * through a custom `fetch` returning real, schema-valid Responses API SSE
- * bytes. Proves the stronger divergence case beyond the existing
- * cli-tools-install-openai-adapter-divergence.test.ts (CASE D): there, A
- * (the streamed tool-input-delta evidence) is truncated, so PSJ's guard
- * never grants positive authority at all — the divergence is moot because
- * nothing would ever dispatch. Here, A is COMPLETE and schema-valid, so
- * the guard DOES grant `authority.value = A` — and B (the SDK's own
- * separately-reported `response.function_call_arguments.done` value) is
- * ALSO complete, schema-valid, and a genuinely DIFFERENT command.
+ * bytes. Proves the stronger divergence case: test 3 below covers the
+ * truncated-A / complete-B scenario (formerly its own CASE D suite, now
+ * subsumed here — A is truncated, so PSJ's guard never grants positive
+ * authority at all, and the divergence is moot because nothing would ever
+ * dispatch). Tests 1/2/4/5 cover the case this file exists for: A is
+ * COMPLETE and schema-valid, so the guard DOES grant `authority.value = A`
+ * — and B (the SDK's own separately-reported
+ * `response.function_call_arguments.done` value) is ALSO complete,
+ * schema-valid, and a genuinely DIFFERENT command.
  *
  * Confirmed directly before writing this file: with such a divergence,
  * agent-loop's own `tool_use` SSE event and ai-sdk's own
@@ -41,7 +42,7 @@ import { randomUUID } from 'node:crypto';
 import { streamText, type ModelMessage } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
 import { assembleTools, resolveToolPermission } from '@/lib/agent-tools';
-import { runCliToolInstall, CLI_TOOL_INSTALL_SCHEMA } from '@/lib/builtin-tools/cli-tools';
+import { runCliToolInstall, CLI_TOOL_INSTALL_SCHEMA, createCliToolsTools } from '@/lib/builtin-tools/cli-tools';
 import type { PermissionMode } from '@/lib/permission-checker';
 
 function sse(events: unknown[]) {
@@ -227,13 +228,21 @@ describe('authority/SDK-projection consistency witness', () => {
     assert.equal(r.sideEffectCalls, 0, 'neither A nor B is ever dispatched to the real side effect');
   });
 
-  it('3. truncated A + valid B: existing fail-closed behavior unchanged (never reaches the witness check at all)', async () => {
+  it('3. truncated A + valid B: existing fail-closed behavior unchanged (never reaches the witness check at all) — subsumes former CASE D', async () => {
     const truncatedA = '{"command":"brew install ffm';
     const B = JSON.stringify({ command: 'brew install ffmpeg', name: 'ffmpeg' });
     const events = functionCallEvents('fc_3', 'call_3', truncatedA, B);
     const r = await runStepWitnessed(events);
+    assert.deepEqual(r.sdkProjectedInput, JSON.parse(B), 'the real @ai-sdk/openai adapter really did project B as the terminal tool-call input, independent of the truncated stream A');
     assert.notEqual(r.decisionAction, 'execute', 'PSJ itself never grants authority for truncated evidence — the same CASE D invariant, unaffected by this fix');
     assert.equal(r.sideEffectCalls, 0);
+
+    // Structural invariant, independent of this scenario: the locked
+    // install tool has no native execute() at all — the guard is the only
+    // gate, never a stripped/disabled callback.
+    const { createAiSdkExecutionLock } = await import('prefix-safe-json');
+    const locked = createAiSdkExecutionLock({ codepilot_cli_tools_install: createCliToolsTools().codepilot_cli_tools_install });
+    assert.equal((locked.codepilot_cli_tools_install as { execute?: unknown }).execute, undefined);
   });
 
   it('4. mismatched A/B: permission 0 (permission is never even requested when they diverge)', async () => {

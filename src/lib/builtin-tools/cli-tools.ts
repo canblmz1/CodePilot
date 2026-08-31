@@ -95,13 +95,10 @@ async function getHelpOutput(binPath: string, signal?: AbortSignal): Promise<str
       const output = (stdout || stderr).trim();
       if (output.length > 50) return output.slice(0, 2000); // truncate to keep context manageable
     } catch (error) {
-      // A signal-triggered abort must propagate immediately, never be
-      // treated as "this flag didn't work, try the next one" — execFile
-      // (unlike exec) spawns the target binary directly with no shell
-      // wrapper, so its own signal-triggered kill already reaches the
-      // real process correctly (confirmed directly on real Linux with a
-      // heartbeat file) — no group-kill mechanism needed here, just
-      // making sure the resulting AbortError isn't swallowed.
+      // A signal-triggered abort must propagate, never be swallowed as
+      // "this flag didn't work, try the next one" — execFile spawns the
+      // target directly with no shell wrapper, so Node's own signal-kill
+      // already reaches the real process correctly here.
       if (error instanceof Error && error.name === 'AbortError') throw error;
       /* any other failure: try next flag */
     }
@@ -161,37 +158,18 @@ function makeAbortError(): NodeJS.ErrnoException {
 }
 
 /**
- * Windows path — proven necessary and sufficient by direct measurement on
- * this project's environment (2026-08-31): passing `signal` straight
- * through to Node's own `child_process.exec` DOES reject the returned
- * promise with a correct AbortError, but does NOT actually kill the real
- * process. `exec()` on Windows runs the command via a `cmd.exe /c
- * "<command>"` wrapper; Node's own signal-triggered kill only ever
- * reaches that wrapper, and it reaps the wrapper before anything asks it
- * to kill what IT spawned (e.g. the real `brew`/`npm`/`powershell`
- * process) — that child is then orphaned and keeps running. Confirmed
- * directly: a heartbeat file written by the "killed" process kept
- * growing for seconds after its promise had already rejected.
+ * Windows: `signal` passed straight to `child_process.exec()` rejects the
+ * promise but does not kill the real process — `exec()` wraps the command
+ * in `cmd.exe /c "..."`, and Node's signal-kill only reaches that wrapper,
+ * orphaning whatever it spawned. Fixed by taking the real child PID
+ * directly and issuing `taskkill /pid <pid> /T /F` on abort, before Node's
+ * own kill can reap the wrapper first.
  *
- * Fix: never hand `signal` to `exec()` itself. Take the real child handle
- * synchronously, and on abort issue our own single `taskkill /pid <pid>
- * /T /F` — `/T` kills the whole tree (the cmd.exe wrapper AND whatever it
- * spawned) while the wrapper is still alive for `taskkill` to enumerate.
- * That ordering is the actual bug: exec's own kill reaps the wrapper
- * first, so a same-pid `/T` issued afterward has nothing left to walk
- * ("process not found").
- *
- * Listener lifecycle: `signal` is `timeoutCtl.signal` — a single,
- * long-lived signal shared across every tool call in the whole run, not
- * one scoped to this call. A `settled` flag plus `signal
- * .removeEventListener` on every terminal path (success, ordinary
- * failure, AND abort) is required so a call that finishes normally can
- * never leave a stale listener attached — without it, a LATER abort
- * elsewhere in the same run would still invoke this call's `onAbort`,
- * `taskkill`-ing whatever process now happens to hold this call's
- * long-exited, since-recycled PID. Confirmed directly: an unpatched
- * version left the listener attached past a normal successful exit, and
- * firing the same signal afterward still invoked the stale handler.
+ * `signal` is `timeoutCtl.signal`, shared across the whole run — a
+ * `settled` flag plus `removeEventListener` on every terminal path (not
+ * just `{ once: true }`) prevents a call that finished normally from
+ * leaving a stale listener that a later, unrelated abort could still fire
+ * against a recycled PID.
  */
 function execWithAbortWindows(
   command: string,
@@ -199,9 +177,7 @@ function execWithAbortWindows(
 ): Promise<{ stdout: string; stderr: string }> {
   const { signal, ...execOptions } = options;
   if (!signal) return execAsync(command, options);
-  // Defense-in-depth: runCliToolInstall already checks this before calling
-  // in, but this function must never spawn the real process on an
-  // already-fired signal regardless of caller discipline.
+  // Defense-in-depth: never spawn on an already-fired signal, even if the caller didn't check.
   if (signal.aborted) return Promise.reject(makeAbortError());
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -223,9 +199,7 @@ function execWithAbortWindows(
       cleanup();
       const pid = child.pid;
       if (pid != null) {
-        // Fire-and-forget: best-effort kill. A process that already
-        // exited on its own between the abort firing and this running
-        // must never block (or throw past) the rejection below.
+        // Fire-and-forget: a process that already exited must never block the rejection below.
         execFile('taskkill', ['/pid', String(pid), '/T', '/F'], () => {});
       }
       reject(makeAbortError());
@@ -236,61 +210,25 @@ function execWithAbortWindows(
 }
 
 /**
- * POSIX path — `signal` passed straight through to `exec()` has the exact
- * same class of bug already found on Windows, confirmed directly on real
- * Linux (WSL2, kernel 6.6, 2026-08-31): the promise rejects correctly,
- * but a plain (non-detached) grandchild the shell-invoked command itself
- * forks — exactly what real install tooling does internally (npm/pip/
- * build steps spawning their own worker subprocesses) — survives as an
- * orphan. `sh -c "<command>"` execve-replacing itself into a SINGLE
- * trailing command (no shell operators) is not the failure mode: killing
- * that one PID does end a simple loop or a bare external binary. The
- * failure is one level deeper — a child THAT command forks, which does
- * not inherit any special relationship to `exec()`'s own signal handling
- * and is not addressed by sending a signal to the immediate PID alone.
+ * POSIX: `signal` passed straight to `exec()` has the same class of bug as
+ * Windows — a plain (non-detached) grandchild the shell-invoked command
+ * itself forks (what real install tooling does internally) survives as an
+ * orphan; killing the immediate `sh -c` PID alone doesn't reach it. Fixed
+ * by spawning with `detached: true` (leader of its own process group) and,
+ * on abort, killing the whole group via `process.kill(-pid, 'SIGKILL')`.
  *
- * Fix, verified the same way: spawn the command with `detached: true`
- * (POSIX `setsid()` — the child becomes the leader of its own new process
- * group) instead of via `exec()`'s own signal option, and on abort send
- * the kill to the whole group via `process.kill(-pid, 'SIGKILL')` (a
- * negative pid is POSIX's process-GROUP target, not a single process) —
- * every descendant that didn't itself create a new group (the common
- * case: a plain worker subprocess, not explicitly detached) dies with
- * it. Confirmed directly with the same outer-tool-spawns-inner-worker
- * shape: heartbeat stops growing immediately, not merely the promise
- * rejecting.
+ * Two termination sources need two distinct shapes: a `signal`-triggered
+ * kill produces an `AbortError` (matching the Windows path); the separate,
+ * pre-existing hardcoded `timeout` mirrors Node's own native `exec()`
+ * timeout shape instead (plain `Error`, `killed: true`, `signal:
+ * 'SIGTERM'`), keeping that unrelated 300s ceiling's behavior unchanged.
  *
- * Two independent termination sources need two independent, correctly
- * distinguished outcomes: a `signal`-triggered kill must produce an
- * `AbortError` (so `runCliToolInstall` propagates it, matching the
- * Windows path); the separate, pre-existing hardcoded `timeout` option
- * must NOT — confirmed empirically that Node's own native `exec()`
- * `timeout` firing produces a plain `Error` (`name: 'Error'`, `killed:
- * true`, `signal: 'SIGTERM'`), never `AbortError` — so this manual
- * POSIX implementation constructs the same non-`AbortError` shape for
- * ITS OWN `timeout` firing, keeping that unrelated, pre-existing 300s
- * ceiling's behavior (swallowed into an ordinary "Installation failed"
- * message, run continues) unchanged from before any of this file's
- * signal plumbing existed.
- *
- * A third bound, independent of both: output size. Node's own `exec()`
- * enforces a `maxBuffer` (default 1 MiB, confirmed empirically: exactly
- * 1048576 bytes resolves, 1048577 rejects with
- * `ERR_CHILD_PROCESS_STDIO_MAXBUFFER`) — this POSIX path spawns
- * `child_process.spawn()` directly instead and accumulates stdout/stderr
- * itself, which does NOT inherit that protection, confirmed directly: an
- * unpatched version accepted 5 MiB of stdout from a real process and
- * resolved normally. A model-controlled arbitrary command's output is not
- * a size CodePilot controls, so this needed its own explicit, real bound
- * — preserving Node's own 1 MiB default and matching its error shape
- * (`RangeError`, `code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'`) rather than
- * inventing a new one. Counted in real bytes off the raw `Buffer` chunks
- * as they arrive (a JS string's `.length` is UTF-16 code units, not
- * bytes — undercounts multi-byte UTF-8 output), and on overflow the whole
- * process GROUP is killed (the same mechanism abort/timeout above already
- * use), not merely the promise rejected — otherwise a still-running,
- * still-producing-output real process would be exactly the same kind of
- * orphan the abort/timeout fixes above exist to prevent.
+ * Output bound: this path accumulates stdout/stderr manually and does not
+ * inherit Node's own `exec()` `maxBuffer` (default 1 MiB) protection —
+ * MAX_OUTPUT_BYTES below restores it, counted in real bytes (not JS string
+ * `.length`, which undercounts multi-byte UTF-8), killing the whole group
+ * on overflow rather than merely rejecting, matching Node's own error
+ * shape (`RangeError`, `ERR_CHILD_PROCESS_STDIO_MAXBUFFER`).
  */
 /** Error shape for a POSIX command failure — deliberately separate from `NodeJS.ErrnoException` (whose `.code` is string-typed, for errno names, not exit codes). */
 interface ExecPosixFailure extends Error {
@@ -314,9 +252,7 @@ function execWithAbortPosix(
 ): Promise<{ stdout: string; stderr: string }> {
   const { signal, timeout, env } = options;
   if (!signal) return execAsync(command, options);
-  // Defense-in-depth: runCliToolInstall already checks this before calling
-  // in, but this function must never spawn the real process on an
-  // already-fired signal regardless of caller discipline.
+  // Defense-in-depth: never spawn on an already-fired signal, even if the caller didn't check.
   if (signal.aborted) return Promise.reject(makeAbortError());
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -376,10 +312,8 @@ function execWithAbortPosix(
       cleanup();
       const pid = child.pid;
       if (pid != null) {
-        // Negative pid = the whole process group, not just this one pid —
-        // required to reach a plain (non-detached) grandchild the
-        // command itself forked. Fire-and-forget: a group that already
-        // exited on its own must never block the rejection below.
+        // Negative pid = the whole process group (reaches a plain grandchild the command forked).
+        // Fire-and-forget: an already-exited group must never block the rejection below.
         try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
       }
       if (reason === 'maxBuffer') {
@@ -391,9 +325,7 @@ function execWithAbortPosix(
       if (reason === 'abort') {
         reject(makeAbortError());
       } else {
-        // Mirrors Node's own native exec() timeout-error shape exactly
-        // (name: 'Error', killed: true, signal: 'SIGTERM') so this
-        // unrelated, pre-existing 300s ceiling's behavior is unchanged.
+        // Mirrors Node's native exec() timeout shape — see preamble above.
         const err = new Error(`Command failed: ${command}`) as ExecPosixFailure;
         err.killed = true;
         err.signal = 'SIGTERM';
@@ -407,10 +339,8 @@ function execWithAbortPosix(
 }
 
 /**
- * Runs `command` with the same result shape as `execAsync(command,
- * options)`, but with a real, empirically-verified process(-tree) kill on
- * abort — see execWithAbortWindows / execWithAbortPosix for the
- * platform-specific mechanism and the measurements behind each.
+ * Runs `command` like `execAsync`, but with a real process(-tree) kill on
+ * abort — see execWithAbortWindows / execWithAbortPosix for the mechanism.
  */
 function execWithAbort(
   command: string,
@@ -422,24 +352,19 @@ function execWithAbort(
 }
 
 /**
- * The real side effect for codepilot_cli_tools_install: installs a CLI
- * tool by executing a shell command, then detects and registers the
- * resulting binary. Body unchanged from the tool's original execute()
- * callback except for the added `signal` plumbing — only hoisted out so
- * it has exactly one caller-agnostic implementation. Never throws for an
- * ordinary command failure (every such path returns a message) — the one
- * exception is a `signal`-triggered abort, which propagates as a real
- * thrown AbortError instead of a normal-looking result, so a caller
- * racing this against a timeout/abort budget can tell the two apart.
+ * The real side effect for codepilot_cli_tools_install — hoisted so it has
+ * exactly one caller-agnostic implementation. Never throws for an ordinary
+ * command failure (returns a message instead); a `signal`-triggered abort
+ * is the one exception, propagating as a real thrown AbortError so a
+ * caller racing this against a timeout/abort budget can tell them apart.
  */
 export async function runCliToolInstall(
   { command, name }: CliToolInstallInput,
   options?: { signal?: AbortSignal },
 ): Promise<string> {
-  // Primary guard: an already-aborted signal must never even start the
-  // real shell command — checked here, once, before anything else in
-  // this function runs (execWithAbort*'s own checks are defense-in-depth
-  // for this same invariant, not a substitute for it).
+  // An already-aborted signal must never start the real shell command —
+  // checked once, here, before anything else runs (execWithAbort*'s own
+  // checks are defense-in-depth for the same invariant).
   if (options?.signal?.aborted) throw makeAbortError();
   try {
     const expandedPath = getExpandedPath();
@@ -520,11 +445,8 @@ export async function runCliToolInstall(
           break;
         }
       } catch (error) {
-        // A signal-triggered abort must propagate immediately, not be
-        // treated as "this candidate didn't resolve, try the next one" —
-        // execFile spawns `which` directly with no shell wrapper, so its
-        // signal-triggered kill already reaches the real process (same
-        // mechanism verified for getHelpOutput above).
+        // Same rule as getHelpOutput above: an abort must propagate, not
+        // be treated as "try the next candidate."
         if (error instanceof Error && error.name === 'AbortError') throw error;
         /* any other failure: try next candidate */
       }
@@ -541,21 +463,15 @@ export async function runCliToolInstall(
         const match = vText.split('\n')[0]?.match(/(\d+\.\d+[\w.-]*)/);
         version = match ? match[1] : null;
       } catch (error) {
-        // Same rule: an abort here must propagate — this is not an
-        // "optional, ignorable" probe failure when the actual cause is
-        // the caller's own signal firing.
+        // Same rule: an abort must propagate, not be treated as an
+        // ignorable probe failure.
         if (error instanceof Error && error.name === 'AbortError') throw error;
         /* --version genuinely unsupported/failed: version stays null, non-fatal */
       }
 
-      // The main install command already succeeded and real filesystem/DB
-      // side effects (registration, below) are about to start — this is
-      // the last point before that where a fired budget or caller abort
-      // that happened to land between two AWAITs (nothing above actually
-      // threw) would otherwise go completely unnoticed. Checked
-      // immediately before create CustomCliTool, per the exact contract:
-      // no DB registration may occur after an abort, whether or not any
-      // individual awaited call above happened to observe it directly.
+      // Last point before real DB registration (below) starts — catches a
+      // budget/abort that landed in the gap between the awaits above,
+      // where nothing actually threw. No new registration once observed.
       if (options?.signal?.aborted) throw makeAbortError();
 
       const toolName = name || binName || path.basename(binPath);
@@ -610,11 +526,9 @@ export async function runCliToolInstall(
     }
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
-      // A fired timeout budget or a caller abort killed the real process
-      // (execWithAbort above) — propagate so the caller's own timeout/
-      // abort classification runs, instead of reporting this as an
-      // ordinary installation failure while the run continues as if
-      // nothing happened.
+      // A fired timeout budget or caller abort killed the real process —
+      // propagate so the caller's own classification runs, instead of
+      // reporting an ordinary installation failure.
       throw error;
     }
     const msg = error instanceof Error ? error.message : 'Command execution failed';

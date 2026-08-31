@@ -186,8 +186,8 @@ function safeInstallStream(toolCallId = 'call_perm') {
   ]);
 }
 
-// ── CASE A ────────────────────────────────────────────────────────────
-describe('CASE A — normal mode, ask, user ALLOW', () => {
+// ── PERM-A ────────────────────────────────────────────────────────────
+describe('PERM-A — normal mode, ask, user ALLOW', () => {
   it('PSJ authority yes, permission requested, shell executes exactly once', async () => {
     const r = await runStepWithPermissions(safeInstallStream(), {
       permissionMode: 'normal',
@@ -200,8 +200,8 @@ describe('CASE A — normal mode, ask, user ALLOW', () => {
   });
 });
 
-// ── CASE B ────────────────────────────────────────────────────────────
-describe('CASE B — normal mode, user DENY', () => {
+// ── PERM-B ────────────────────────────────────────────────────────────
+describe('PERM-B — normal mode, user DENY', () => {
   it('PSJ authority yes, shell executes zero times', async () => {
     const r = await runStepWithPermissions(safeInstallStream(), {
       permissionMode: 'normal',
@@ -215,8 +215,8 @@ describe('CASE B — normal mode, user DENY', () => {
   });
 });
 
-// ── CASE C ────────────────────────────────────────────────────────────
-describe('CASE C — PSJ rejects, user would have allowed', () => {
+// ── PERM-C ────────────────────────────────────────────────────────────
+describe('PERM-C — PSJ rejects, user would have allowed', () => {
   it('permission is never even reached; zero side effects', async () => {
     const truncated = '{"command":"brew install ffm';
     const model = mockModel([
@@ -236,8 +236,8 @@ describe('CASE C — PSJ rejects, user would have allowed', () => {
   });
 });
 
-// ── CASE D ────────────────────────────────────────────────────────────
-describe('CASE D — user edits the command during approval', () => {
+// ── PERM-D ────────────────────────────────────────────────────────────
+describe('PERM-D — user edits the command during approval', () => {
   it('original authority.value.command is NOT executed; the explicitly-approved edited command is revalidated and executed once', async () => {
     const r = await runStepWithPermissions(safeInstallStream(), {
       permissionMode: 'normal',
@@ -260,8 +260,8 @@ describe('CASE D — user edits the command during approval', () => {
   });
 });
 
-// ── CASE E ────────────────────────────────────────────────────────────
-describe('CASE E — full_access / bypassPermissions', () => {
+// ── PERM-E ────────────────────────────────────────────────────────────
+describe('PERM-E — full_access / bypassPermissions', () => {
   it('no permission prompt; valid PSJ authority executes once', async () => {
     const r = await runStepWithPermissions(safeInstallStream(), { bypassPermissions: true });
     assert.equal(r.permissionRequestCount, 0, 'no permission prompt in bypass mode');
@@ -270,8 +270,8 @@ describe('CASE E — full_access / bypassPermissions', () => {
   });
 });
 
-// ── CASE F ────────────────────────────────────────────────────────────
-describe('CASE F — no PSJ authority, any permission mode', () => {
+// ── PERM-F ────────────────────────────────────────────────────────────
+describe('PERM-F — no PSJ authority, any permission mode', () => {
   for (const bypassPermissions of [false, true]) {
     it(`bypassPermissions=${bypassPermissions}: never executes`, async () => {
       const truncated = '{"command":"brew install ffm';
@@ -289,8 +289,8 @@ describe('CASE F — no PSJ authority, any permission mode', () => {
   }
 });
 
-// ── CASE G ────────────────────────────────────────────────────────────
-describe('CASE G — two same-step installs, full permission integration', () => {
+// ── PERM-G ────────────────────────────────────────────────────────────
+describe('PERM-G — two same-step installs, full permission integration', () => {
   it('independent PSJ authorities, independent permission decisions, no cross-consumption', async () => {
     const argsA = JSON.stringify({ command: 'echo call-A', name: 'tool-a' });
     const argsB = JSON.stringify({ command: 'echo call-B', name: 'tool-b' });
