@@ -120,14 +120,14 @@ When listing tools with format="json", each tool includes: agentFriendly (design
 // intent: an AI SDK provider adapter's separately-projected final
 // tool-call input can diverge from what was actually streamed, even
 // under a safe finish reason and even when the JSON is schema-valid —
-// reproduced directly against the real @ai-sdk/openai adapter (see the
-// research report accompanying this change). This tool is therefore
-// execution-locked (see agent-loop.ts, which applies
+// reproduced directly against the real @ai-sdk/openai adapter (see
+// cli-tools-install-openai-adapter-divergence.test.ts). This tool is
+// therefore execution-locked (see agent-loop.ts, which applies
 // prefix-safe-json's createAiSdkExecutionLock to this key only) and its
 // real side effect is dispatched manually, only after
-// createAiSdkExecutionGuard has confirmed authority from the raw
-// SDK-emitted tool-input delta evidence — never from this tool's own
-// (nonexistent, on a locked tool) execute() input.
+// createAiSdkExecutionGuard has confirmed authority from SDK-emitted
+// tool-input-delta evidence — never from this tool's own (nonexistent,
+// on a locked tool) execute() input.
 //
 // The schema and the side effect are both exported standalone, shared by
 // the tool definition below and by agent-loop.ts's manual-authority
@@ -443,7 +443,7 @@ export function createCliToolsTools() {
     // immediately after tool assembly. The real side effect is
     // runCliToolInstall (defined above createCliToolsTools in this file),
     // dispatched manually only after prefix-safe-json's execution guard
-    // grants authority from raw streamed tool-input evidence.
+    // grants authority from SDK-emitted tool-input-delta evidence.
     codepilot_cli_tools_install: {
       description: 'Install a CLI tool by executing a shell command (e.g. "brew install ffmpeg", "pip install yt-dlp"). After the command succeeds, the tool is automatically detected and registered. This tool requires user permission before execution. After calling this tool, generate a bilingual description and call codepilot_cli_tools_add to save it.',
       inputSchema: CLI_TOOL_INSTALL_SCHEMA,

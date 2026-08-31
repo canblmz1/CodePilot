@@ -1,13 +1,14 @@
 /**
- * RESEARCH/CANDIDATE REGRESSIONS — NOT part of any commit history, not
- * pushed. Exercises the real createCliToolsTools() factory, the real
- * runCliToolInstall (both from src/lib/builtin-tools/cli-tools.ts, as
- * modified by this local candidate), and prefix-safe-json's real
- * createAiSdkExecutionLock/createAiSdkExecutionGuard, through real
- * streamText() + MockLanguageModelV4. The `runStep` helper below is a
- * deliberately minimal, faithful re-statement of exactly the logic added
- * to agent-loop.ts (same calls, same order, same non-negotiable-invariant
- * dispatch from authority.value) — not a different implementation.
+ * Execution-authority lifecycle tests for codepilot_cli_tools_install.
+ *
+ * Exercises the real createCliToolsTools() factory and the real
+ * runCliToolInstall (both from src/lib/builtin-tools/cli-tools.ts) together
+ * with prefix-safe-json's real createAiSdkExecutionLock/
+ * createAiSdkExecutionGuard, through real streamText() + MockLanguageModelV4.
+ * The `runStep` helper below is a deliberately minimal, faithful
+ * re-statement of exactly the dispatch logic in agent-loop.ts (same calls,
+ * same order, same invariant: the shell only ever runs on authority.value)
+ * — not a separate implementation that could quietly drift from it.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -224,8 +225,8 @@ describe('CASE E — duplicate authority consumption', () => {
   });
 });
 
-// ── CASE F — no raw deltas ───────────────────────────────────────────────
-describe('CASE F — no raw deltas available', () => {
+// ── CASE F — no tool-input-delta evidence ────────────────────────────────
+describe('CASE F — no tool-input-delta evidence available', () => {
   it('terminal-only tool-call, no tool-input-start/delta/end: fails closed, no fallback to SDK input', async () => {
     const args = JSON.stringify({ command: 'echo case-f', name: 'case-f' });
     const model = mockModel([
@@ -235,7 +236,7 @@ describe('CASE F — no raw deltas available', () => {
     ]);
     const r = await runStep(model);
     const matching = r.decisions.filter((d) => d.name === 'codepilot_cli_tools_install');
-    assert.equal(matching.length, 0, 'no decision at all is produced for a call with no raw evidence — not a silent fallback to the SDK-projected input');
+    assert.equal(matching.length, 0, 'no decision at all is produced for a call with no tool-input-delta evidence — not a silent fallback to the SDK-projected input');
     assert.equal(r.installSideEffectCalls, 0);
   });
 });

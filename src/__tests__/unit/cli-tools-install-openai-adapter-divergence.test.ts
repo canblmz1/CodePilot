@@ -1,13 +1,14 @@
 /**
- * RESEARCH/CANDIDATE REGRESSION — CASE D — NOT part of any commit, not
- * pushed. Real, unmodified @ai-sdk/openai@4.0.52 (installed --no-save,
- * testing the general provider-adapter architecture — not a claim about
- * CodePilot's own currently-pinned @ai-sdk/openai@4.0.5's exact internal
- * layout, which is organized differently release-to-release but shares
- * the same Responses API event contract). A custom `fetch` returns real,
- * schema-valid Responses API SSE bytes; nothing below the HTTP layer is
- * mocked. Drives the REAL createCliToolsTools() install tool through the
- * exact dispatch logic added to agent-loop.ts.
+ * CASE D — real @ai-sdk/openai adapter, projected-input divergence.
+ *
+ * Real, unmodified @ai-sdk/openai (this repo's own pinned ^4.0.5) driven
+ * through a custom `fetch` that returns real, schema-valid Responses API
+ * SSE bytes — nothing below the HTTP layer is mocked. Drives the real
+ * createCliToolsTools() install tool through the exact dispatch logic in
+ * agent-loop.ts, reproducing the divergence this guard exists for: the
+ * adapter's separately-projected final tool-call input can differ from
+ * what it actually streamed as tool-input-delta events, even under a
+ * safe finish reason and even when the projected value is schema-valid.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -33,7 +34,7 @@ const itemId = 'fc_case_d';
 const callId = 'call_case_d';
 
 describe('CASE D — OpenAI real-adapter projected-input divergence', () => {
-  it('streamed delta evidence truncated (A), final SDK-projected input different (B): native execute=0, side effect never runs on B, authority.value is never even offered because raw evidence never completed', async () => {
+  it('streamed delta evidence truncated (A), final SDK-projected input different (B): native execute=0, side effect never runs on B, authority.value is never even offered because tool-input-delta evidence never completed', async () => {
     seq = 0;
     const truncatedDelta = '{"command":"brew install ffm';
     // The provider's own separately-reported "done" value — syntactically
@@ -112,7 +113,7 @@ describe('CASE D — OpenAI real-adapter projected-input divergence', () => {
       }
     }
 
-    // Not necessarily 'reject' specifically — the raw evidence here looks
+    // Not necessarily 'reject' specifically — the tool-input-delta evidence here looks
     // like an in-progress truncation, not confirmed-malformed JSON, so the
     // guard's own decision vocabulary correctly classifies it 'retry'
     // ("nothing wrong with what arrived, no trustworthy complete value

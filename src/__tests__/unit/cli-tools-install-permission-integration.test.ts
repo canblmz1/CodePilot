@@ -1,9 +1,13 @@
 /**
- * P0 FIX REGRESSION — real production assembly path. NOT part of any
- * commit history, not pushed. Uses assembleTools({ permissionContext })
- * directly — the same entry point agent-loop.ts actually calls — never
- * createCliToolsTools() as a substitute. Proves the permission system is
- * NOT bypassed by the manual-authority dispatch path.
+ * codepilot_cli_tools_install — permission-system integration.
+ *
+ * Uses assembleTools({ permissionContext }) directly — the same entry
+ * point agent-loop.ts actually calls — never createCliToolsTools() as a
+ * substitute, so this exercises wrapWithPermissions' real
+ * MANUAL_AUTHORITY_TOOLS branch. Proves the permission system (ask,
+ * allow, deny, updatedInput, session approval, full_access) is never
+ * bypassed by the manual-authority dispatch path that runs after
+ * prefix-safe-json grants execution authority.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';

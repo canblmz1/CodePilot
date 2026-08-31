@@ -194,9 +194,10 @@ function getSessionRules(sessionId: string): Array<{ permission: string; pattern
 /**
  * Tools that never carry a native `execute` at all — locked via
  * prefix-safe-json's `createAiSdkExecutionLock` so nothing in this process
- * can run them before an execution guard reaches a decision from raw
- * streamed evidence — and whose real side effect is dispatched manually
- * elsewhere (agent-loop.ts), after that authority is granted.
+ * can run them before an execution guard reaches a decision from
+ * SDK-emitted tool-input-delta evidence — and whose real side effect is
+ * dispatched manually elsewhere (agent-loop.ts), after that authority is
+ * granted.
  *
  * `wrapWithPermissions` must pass these through unwrapped: its generic
  * wrapper assumes there is an `original.execute` to call once permission

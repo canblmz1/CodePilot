@@ -311,8 +311,9 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
         // (reproduced directly against the real @ai-sdk/openai adapter).
         // createAiSdkExecutionLock removes execute/onInputStart/
         // onInputDelta/onInputAvailable so nothing in this process can run
-        // it before the per-step guard below reaches a decision from raw
-        // streamed evidence. Every other tool in `tools` is unaffected —
+        // it before the per-step guard below reaches a decision from
+        // SDK-emitted tool-input-delta evidence. Every other tool in
+        // `tools` is unaffected —
         // this branch only fires if the key is actually present (e.g. not
         // mounted at all in a permission profile that excludes cli-tools).
         if (tools.codepilot_cli_tools_install) {
@@ -894,8 +895,8 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
           // this block only ever matches decisions for the one locked tool.
           // Because the tool has no execute callback, a valid call cannot
           // have produced a native SDK tool-result before this point —
-          // confirmed empirically, not assumed (see the accompanying
-          // research report). Fail closed: no authority, no dispatch.
+          // confirmed empirically by the execution-authority lifecycle
+          // tests, not assumed. Fail closed: no authority, no dispatch.
           const stepFinishReasonForGuard = await result.finishReason;
           const { decisions: guardDecisions } = stepGuard.finish({
             providerReason: String(stepFinishReasonForGuard),
