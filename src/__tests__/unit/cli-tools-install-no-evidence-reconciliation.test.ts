@@ -14,14 +14,17 @@
  * back... it produces an explicit skipped/rejected tool-result instead")
  * was true for REJECTED decisions but not for ABSENT ones.
  *
- * Structural note, confirmed directly against the real Anthropic wire
- * before writing this file: this scenario is NOT reachable through any
- * real provider's SSE stream, Anthropic included — every real provider
- * adapter emits a `tool-input-start`-equivalent before any terminal
- * `tool-call`, which is enough for the guard to track the call and
- * produce SOME decision (e.g. `action: 'retry'`, which the pre-existing
- * "explicit reject" branch already handled correctly). Zero decisions
- * only arises from a terminal `tool-call` part with no tracked history at
+ * Structural note: not reproduced through the provider adapter tested
+ * here — confirmed directly against the real Anthropic wire, the only
+ * one exercised for this specific question, that a `tool-input-start`-
+ * equivalent always precedes any terminal `tool-call`, which is enough
+ * for the guard to track the call and produce SOME decision (e.g.
+ * `action: 'retry'`, which the pre-existing "explicit reject" branch
+ * already handled correctly). Whether every OTHER provider adapter
+ * CodePilot supports shares that same ordering was not independently
+ * verified here — this is Anthropic-specific evidence, not a claim about
+ * the general case. Zero decisions
+ * only arise from a terminal `tool-call` part with no tracked history at
  * all — reachable only via a raw AI-SDK-level tool-call injection
  * (MockLanguageModelV4, no preceding tool-input-start/delta/end), exactly
  * CASE F's own construction. Since runAgentLoop() has no model-injection

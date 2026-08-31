@@ -11,6 +11,7 @@
  */
 
 import { streamText, type LanguageModel, type ToolSet, type ModelMessage } from 'ai';
+import { isDeepStrictEqual } from 'node:util';
 import type { SSEEvent, TokenUsage, MediaBlock, ExternalSource } from '@/types';
 import { subscribeBuiltinEvents } from './harness/builtin-event-bus';
 import { createModel } from './ai-provider';
@@ -737,6 +738,22 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
           // different guarantee than the explicit fail-closed result this
           // file's own dispatch is supposed to produce.
           const observedInstallToolCallIds = new Set<string>();
+          // The SDK's own separately-projected terminal input for each
+          // observed install call — captured ONLY as a consistency witness,
+          // never as a value this dispatch ever executes or requests
+          // permission for. Real @ai-sdk/openai adapter, proven directly:
+          // `response.function_call_arguments.done`'s `arguments` field is
+          // an independently-sourced field the adapter never reconciles
+          // against the tool-input-delta stream — it can be a COMPLETE,
+          // schema-valid, but entirely DIFFERENT command than what was
+          // actually streamed and than what authority.value (below) will
+          // be. This is what agent-loop's own `tool_use` SSE event and
+          // ai-sdk's own `response.messages` history both display —
+          // meaning a caller trusting authority.value alone for EXECUTION
+          // while this diverges is executing one command while showing the
+          // user and the model's own history a DIFFERENT one. Reconciled
+          // against authority.value below, before permission or dispatch.
+          const sdkProjectedInputByToolCallId = new Map<string, unknown>();
           let externalSources: ExternalSource[] = [];
           const providerSearchResults = new Map<string, {
             content: string;
@@ -788,6 +805,7 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
                 distinctTools.add(event.toolName);
                 if (event.toolName === 'codepilot_cli_tools_install' && event.toolCallId) {
                   observedInstallToolCallIds.add(event.toolCallId);
+                  sdkProjectedInputByToolCallId.set(event.toolCallId, event.input);
                 }
                 // Phase 7 — accumulate for Context Accounting at result time.
                 toolInvocationAccumulator.recordToolUse(
@@ -969,12 +987,43 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
                 isError = true;
               } else {
                 const parsedInput = CLI_TOOL_INSTALL_SCHEMA.safeParse(authority.value);
+                // Consistency witness check: does the SDK's own separately-
+                // projected terminal input for this toolCallId (captured
+                // above, purely as a witness — never dispatched, never
+                // requested for permission) structurally agree with
+                // authority.value? Proven directly against the real
+                // @ai-sdk/openai adapter that these CAN diverge — both
+                // complete, both schema-valid, genuinely different commands
+                // — because response.function_call_arguments.done's
+                // `arguments` field is independently sourced, never
+                // reconciled against the delta stream by the adapter. When
+                // they diverge, agent-loop's own `tool_use` SSE event and
+                // ai-sdk's own `response.messages` history both display the
+                // SDK's projection (B), not authority.value (A) — so
+                // dispatching A here regardless would execute a DIFFERENT
+                // command than the one shown to the user and recorded in
+                // the model's own history. Neither value is trustworthy
+                // once they disagree — this blocks entirely rather than
+                // picking one. isDeepStrictEqual: structural, property-
+                // order-independent — never a stringify-and-compare, which
+                // would false-positive on two semantically-identical
+                // objects serialized with different key order.
+                const sdkProjectedInput = sdkProjectedInputByToolCallId.get(toolCallId);
+                const projectedInputDiverges = parsedInput.success && !isDeepStrictEqual(authority.value, sdkProjectedInput);
                 if (!parsedInput.success) {
                   // Should be unreachable — the guard's own schema
                   // validation already required this shape — but never
                   // trust authority.value into a shell command without
                   // re-validating its own type here too.
                   outcomeText = 'Installation blocked: the authorized value did not match the expected install-tool shape.';
+                  isError = true;
+                } else if (projectedInputDiverges) {
+                  // Permission is NEVER requested and the shell is NEVER
+                  // dispatched for this call — not with authority.value,
+                  // not with the SDK's projection. One explicit, terminal,
+                  // fail-closed tool-result, same as every other blocked
+                  // branch here, so the next-step history stays valid.
+                  outcomeText = 'Installation blocked: the execution-authority value and the SDK-projected tool-call input for this call disagree — the surrounding response is internally inconsistent, so neither value is dispatched.';
                   isError = true;
                 } else if (!toolPermissionContext) {
                   // full_access / bypassPermissions: same as every other

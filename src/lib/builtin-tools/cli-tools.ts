@@ -82,7 +82,7 @@ function buildUpdateCommand(method: string, packageName: string): string | null 
 }
 
 /** Run --help on a binary and return truncated output for context. */
-async function getHelpOutput(binPath: string): Promise<string> {
+async function getHelpOutput(binPath: string, signal?: AbortSignal): Promise<string> {
   const env = { ...process.env, PATH: getExpandedPath() };
   // Try --help first, fall back to -h
   for (const flag of ['--help', '-h']) {
@@ -90,10 +90,21 @@ async function getHelpOutput(binPath: string): Promise<string> {
       const { stdout, stderr } = await execFileAsync(binPath, [flag], {
         timeout: 5000,
         env,
+        signal,
       });
       const output = (stdout || stderr).trim();
       if (output.length > 50) return output.slice(0, 2000); // truncate to keep context manageable
-    } catch { /* try next flag */ }
+    } catch (error) {
+      // A signal-triggered abort must propagate immediately, never be
+      // treated as "this flag didn't work, try the next one" — execFile
+      // (unlike exec) spawns the target binary directly with no shell
+      // wrapper, so its own signal-triggered kill already reaches the
+      // real process correctly (confirmed directly on real Linux with a
+      // heartbeat file) — no group-kill mechanism needed here, just
+      // making sure the resulting AbortError isn't swallowed.
+      if (error instanceof Error && error.name === 'AbortError') throw error;
+      /* any other failure: try next flag */
+    }
   }
   return '';
 }
@@ -257,6 +268,25 @@ function execWithAbortWindows(
  * ceiling's behavior (swallowed into an ordinary "Installation failed"
  * message, run continues) unchanged from before any of this file's
  * signal plumbing existed.
+ *
+ * A third bound, independent of both: output size. Node's own `exec()`
+ * enforces a `maxBuffer` (default 1 MiB, confirmed empirically: exactly
+ * 1048576 bytes resolves, 1048577 rejects with
+ * `ERR_CHILD_PROCESS_STDIO_MAXBUFFER`) — this POSIX path spawns
+ * `child_process.spawn()` directly instead and accumulates stdout/stderr
+ * itself, which does NOT inherit that protection, confirmed directly: an
+ * unpatched version accepted 5 MiB of stdout from a real process and
+ * resolved normally. A model-controlled arbitrary command's output is not
+ * a size CodePilot controls, so this needed its own explicit, real bound
+ * — preserving Node's own 1 MiB default and matching its error shape
+ * (`RangeError`, `code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'`) rather than
+ * inventing a new one. Counted in real bytes off the raw `Buffer` chunks
+ * as they arrive (a JS string's `.length` is UTF-16 code units, not
+ * bytes — undercounts multi-byte UTF-8 output), and on overflow the whole
+ * process GROUP is killed (the same mechanism abort/timeout above already
+ * use), not merely the promise rejected — otherwise a still-running,
+ * still-producing-output real process would be exactly the same kind of
+ * orphan the abort/timeout fixes above exist to prevent.
  */
 /** Error shape for a POSIX command failure — deliberately separate from `NodeJS.ErrnoException` (whose `.code` is string-typed, for errno names, not exit codes). */
 interface ExecPosixFailure extends Error {
@@ -266,6 +296,13 @@ interface ExecPosixFailure extends Error {
   stdout?: string;
   stderr?: string;
 }
+
+/**
+ * Matches Node's own `child_process.exec()` default `maxBuffer` exactly
+ * (confirmed empirically, not assumed) — behavioral parity with the
+ * pre-existing, pre-this-file bound, not a newly invented value.
+ */
+const MAX_OUTPUT_BYTES = 1024 * 1024;
 
 function execWithAbortPosix(
   command: string,
@@ -277,15 +314,27 @@ function execWithAbortPosix(
     let settled = false;
     let stdout = '';
     let stderr = '';
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
     const child = spawn('sh', ['-c', command], {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
       env,
     });
-    child.stdout.on('data', (d: Buffer) => { stdout += d; });
-    child.stderr.on('data', (d: Buffer) => { stderr += d; });
+    child.stdout.on('data', (d: Buffer) => {
+      if (settled) return; // overflow/abort/timeout already fired — stop accumulating
+      stdoutBytes += d.length; // Buffer.length is bytes, not JS string chars
+      if (stdoutBytes > MAX_OUTPUT_BYTES) { killGroup('maxBuffer', 'stdout'); return; }
+      stdout += d;
+    });
+    child.stderr.on('data', (d: Buffer) => {
+      if (settled) return;
+      stderrBytes += d.length;
+      if (stderrBytes > MAX_OUTPUT_BYTES) { killGroup('maxBuffer', 'stderr'); return; }
+      stderr += d;
+    });
 
-    const timeoutTimer = timeout > 0 ? setTimeout(() => killGroup(false), timeout) : null;
+    const timeoutTimer = timeout > 0 ? setTimeout(() => killGroup('timeout'), timeout) : null;
     const cleanup = () => {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       signal.removeEventListener('abort', onAbort);
@@ -313,7 +362,7 @@ function execWithAbortPosix(
       reject(err);
     });
 
-    function killGroup(isAbortSignal: boolean) {
+    function killGroup(reason: 'abort' | 'timeout' | 'maxBuffer', overflowedStream?: 'stdout' | 'stderr') {
       if (settled) return; // child already completed on its own — never act on a stale/racing trigger
       settled = true;
       cleanup();
@@ -325,7 +374,13 @@ function execWithAbortPosix(
         // exited on its own must never block the rejection below.
         try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
       }
-      if (isAbortSignal) {
+      if (reason === 'maxBuffer') {
+        const err = new RangeError(`${overflowedStream} maxBuffer length exceeded`) as ExecPosixFailure & { code?: string };
+        err.code = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+        reject(err);
+        return;
+      }
+      if (reason === 'abort') {
         reject(makeAbortError());
       } else {
         // Mirrors Node's own native exec() timeout-error shape exactly
@@ -337,7 +392,7 @@ function execWithAbortPosix(
         reject(err);
       }
     }
-    function onAbort() { killGroup(true); }
+    function onAbort() { killGroup('abort'); }
     if (signal.aborted) onAbort();
     else signal.addEventListener('abort', onAbort, { once: true });
   });
@@ -443,6 +498,7 @@ export async function runCliToolInstall(
         const { stdout: whichOut } = await execFileAsync('/usr/bin/which', [candidate], {
           timeout: 5000,
           env: { ...process.env, PATH: expandedPath },
+          signal: options?.signal,
         });
         const resolved = whichOut.trim().split(/\r?\n/)[0]?.trim();
         if (resolved) {
@@ -450,7 +506,15 @@ export async function runCliToolInstall(
           binName = candidate;
           break;
         }
-      } catch { /* try next candidate */ }
+      } catch (error) {
+        // A signal-triggered abort must propagate immediately, not be
+        // treated as "this candidate didn't resolve, try the next one" —
+        // execFile spawns `which` directly with no shell wrapper, so its
+        // signal-triggered kill already reaches the real process (same
+        // mechanism verified for getHelpOutput above).
+        if (error instanceof Error && error.name === 'AbortError') throw error;
+        /* any other failure: try next candidate */
+      }
     }
 
     if (binPath) {
@@ -458,11 +522,28 @@ export async function runCliToolInstall(
         const { stdout: vOut, stderr: vErr } = await execFileAsync(binPath, ['--version'], {
           timeout: 5000,
           env: { ...process.env, PATH: expandedPath },
+          signal: options?.signal,
         });
         const vText = (vOut || vErr).trim();
         const match = vText.split('\n')[0]?.match(/(\d+\.\d+[\w.-]*)/);
         version = match ? match[1] : null;
-      } catch { /* optional */ }
+      } catch (error) {
+        // Same rule: an abort here must propagate — this is not an
+        // "optional, ignorable" probe failure when the actual cause is
+        // the caller's own signal firing.
+        if (error instanceof Error && error.name === 'AbortError') throw error;
+        /* --version genuinely unsupported/failed: version stays null, non-fatal */
+      }
+
+      // The main install command already succeeded and real filesystem/DB
+      // side effects (registration, below) are about to start — this is
+      // the last point before that where a fired budget or caller abort
+      // that happened to land between two AWAITs (nothing above actually
+      // threw) would otherwise go completely unnoticed. Checked
+      // immediately before create CustomCliTool, per the exact contract:
+      // no DB registration may occur after an abort, whether or not any
+      // individual awaited call above happened to observe it directly.
+      if (options?.signal?.aborted) throw makeAbortError();
 
       const toolName = name || binName || path.basename(binPath);
       const registeredTool = createCustomCliTool({
@@ -499,7 +580,7 @@ export async function runCliToolInstall(
       }
 
       // Capture --help output so the model can generate an accurate description
-      const helpOutput = await getHelpOutput(binPath);
+      const helpOutput = await getHelpOutput(binPath, options?.signal);
       if (helpOutput) {
         resultLines.push('');
         resultLines.push('--- Tool Help Output ---');
