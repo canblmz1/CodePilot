@@ -112,11 +112,200 @@ After installing or registering a tool, the --help output is automatically inclu
 When listing tools with format="json", each tool includes: agentFriendly (designed for AI agents), supportsJson (structured JSON output), supportsSchema (runtime API schema introspection), supportsDryRun (preview before mutating), contextFriendly (field masks/pagination to save context window), and healthCheckCommand (verify auth/health). Prefer agent-friendly tools; use --dry-run before destructive actions; use field masks to limit response size; use healthCheckCommand after install.
 </cli-tools-capability>`;
 
+// ── Install: schema + real side effect ─────────────────────────────────
+//
+// codepilot_cli_tools_install executes an arbitrary shell command built
+// from model-generated text. It is the one tool in this file where "the
+// model asked for it and the JSON parsed" is not sufficient proof of
+// intent: an AI SDK provider adapter's separately-projected final
+// tool-call input can diverge from what was actually streamed, even
+// under a safe finish reason and even when the JSON is schema-valid —
+// reproduced directly against the real @ai-sdk/openai adapter (see the
+// research report accompanying this change). This tool is therefore
+// execution-locked (see agent-loop.ts, which applies
+// prefix-safe-json's createAiSdkExecutionLock to this key only) and its
+// real side effect is dispatched manually, only after
+// createAiSdkExecutionGuard has confirmed authority from the raw
+// SDK-emitted tool-input delta evidence — never from this tool's own
+// (nonexistent, on a locked tool) execute() input.
+//
+// The schema and the side effect are both exported standalone, shared by
+// the tool definition below and by agent-loop.ts's manual-authority
+// dispatch path, so there is exactly ONE implementation of the real
+// install logic — never duplicated between a native-execute path and a
+// manual path.
+export const CLI_TOOL_INSTALL_SCHEMA = z.object({
+  command: z.string().describe('The install command to execute, e.g. "brew install ffmpeg"'),
+  name: z.string().optional().describe('Display name for the tool. If omitted, extracted from the command.'),
+});
+
+export type CliToolInstallInput = z.infer<typeof CLI_TOOL_INSTALL_SCHEMA>;
+
+/**
+ * The real side effect for codepilot_cli_tools_install: installs a CLI
+ * tool by executing a shell command, then detects and registers the
+ * resulting binary. Body unchanged from the tool's original execute()
+ * callback — only hoisted out so it has exactly one caller-agnostic
+ * implementation. Never throws; every failure path returns a message.
+ */
+export async function runCliToolInstall({ command, name }: CliToolInstallInput): Promise<string> {
+  try {
+    const expandedPath = getExpandedPath();
+    const installMethod = extractInstallMethod(command);
+    const installPackage = extractPackageSpec(command);
+
+    const { stdout, stderr } = await execAsync(command, {
+      timeout: 300_000,
+      env: { ...process.env, PATH: expandedPath },
+    });
+
+    const output = (stdout + '\n' + stderr).trim();
+
+    // Build a list of binary name candidates to try with `which`.
+    // Package spec ≠ binary name, so we try multiple candidates:
+    //   "brew install ffmpeg" → ["ffmpeg"]
+    //   "npm install -g @elevenlabs/cli" → catalog binNames ["elevenlabs"], then ["cli"]
+    //   "brew install stripe/stripe-cli/stripe" → ["stripe"]
+    //   "npm install -g @music163/ncm-cli" → catalog binNames ["ncm-cli"]
+    const cmdParts = command.trim().split(/\s+/);
+    const binCandidates: string[] = [];
+    let rawPkgArg: string | null = null;
+    const installIdx = cmdParts.findIndex(p => p === 'install');
+    if (installIdx >= 0) {
+      for (let i = installIdx + 1; i < cmdParts.length; i++) {
+        if (!cmdParts[i].startsWith('-')) {
+          rawPkgArg = cmdParts[i].replace(/@[\d.]*$/, ''); // strip version pinning
+          break;
+        }
+      }
+    }
+
+    // Priority 1: check if a catalog tool matches this package — use its declared binNames
+    if (rawPkgArg) {
+      const matchingCatalog = CLI_TOOLS_CATALOG.find(c =>
+        c.installMethods.some(m => m.command.includes(rawPkgArg!))
+      );
+      if (matchingCatalog) {
+        binCandidates.push(...matchingCatalog.binNames);
+      }
+    }
+
+    // Priority 2: derive candidates from the package arg itself
+    if (rawPkgArg) {
+      const segments = rawPkgArg.split('/');
+      // Last segment (e.g. "stripe" from "stripe/stripe-cli/stripe", "ncm-cli" from "@music163/ncm-cli")
+      const last = segments[segments.length - 1];
+      if (last && !binCandidates.includes(last)) binCandidates.push(last);
+      // For scoped packages like @scope/name, also try "name" without scope
+      if (segments.length >= 2 && segments[0].startsWith('@')) {
+        const scopeless = segments[1];
+        if (scopeless && !binCandidates.includes(scopeless)) binCandidates.push(scopeless);
+      }
+    }
+
+    if (binCandidates.length === 0) {
+      return `Command executed successfully but could not determine the binary name.\nOutput:\n${output.slice(0, 1000)}\n\nPlease use codepilot_cli_tools_add with the binary path to register it manually.`;
+    }
+
+    invalidateDetectCache();
+
+    // Try each candidate with `which` until one resolves
+    let binPath: string | null = null;
+    let binName: string | null = null;
+    let version: string | null = null;
+    for (const candidate of binCandidates) {
+      try {
+        const { stdout: whichOut } = await execFileAsync('/usr/bin/which', [candidate], {
+          timeout: 5000,
+          env: { ...process.env, PATH: expandedPath },
+        });
+        const resolved = whichOut.trim().split(/\r?\n/)[0]?.trim();
+        if (resolved) {
+          binPath = resolved;
+          binName = candidate;
+          break;
+        }
+      } catch { /* try next candidate */ }
+    }
+
+    if (binPath) {
+      try {
+        const { stdout: vOut, stderr: vErr } = await execFileAsync(binPath, ['--version'], {
+          timeout: 5000,
+          env: { ...process.env, PATH: expandedPath },
+        });
+        const vText = (vOut || vErr).trim();
+        const match = vText.split('\n')[0]?.match(/(\d+\.\d+[\w.-]*)/);
+        version = match ? match[1] : null;
+      } catch { /* optional */ }
+
+      const toolName = name || binName || path.basename(binPath);
+      const registeredTool = createCustomCliTool({
+        name: toolName,
+        binPath,
+        binName: binName || path.basename(binPath),
+        version,
+        installMethod,
+        installPackage: installPackage || undefined,
+      });
+
+      const verStr = version ? ` v${version}` : '';
+      const resultLines = [
+        `Successfully installed and registered "${toolName}"${verStr}.`,
+        `Path: ${binPath}`,
+        `Tool ID: ${registeredTool.id}`,
+        `Install method: ${installMethod}`,
+      ];
+
+      // Check if this is a catalog tool that needs auth setup
+      const catalogDef = CLI_TOOLS_CATALOG.find(
+        c => c.binNames.includes(binName!) || c.id === binName
+      );
+      if (catalogDef?.setupType === 'needs_auth') {
+        resultLines.push('');
+        resultLines.push('⚠ This tool requires authentication before use:');
+        const steps = catalogDef.guideSteps.en;
+        // Skip the install step (usually first), show remaining setup steps
+        for (let i = 1; i < steps.length; i++) {
+          resultLines.push(`  ${i}. ${steps[i]}`);
+        }
+        resultLines.push('');
+        resultLines.push('Please guide the user through the authentication steps above.');
+      }
+
+      // Capture --help output so the model can generate an accurate description
+      const helpOutput = await getHelpOutput(binPath);
+      if (helpOutput) {
+        resultLines.push('');
+        resultLines.push('--- Tool Help Output ---');
+        resultLines.push(helpOutput);
+        resultLines.push('--- End Help Output ---');
+      }
+
+      resultLines.push('');
+      resultLines.push('Now please generate a bilingual description (zh/en) based on the help output above and call codepilot_cli_tools_add to save it.');
+
+      return resultLines.join('\n');
+    } else {
+      return `Command executed but could not locate "${binName}" in PATH after installation.\nOutput:\n${output.slice(0, 1000)}\n\nThe tool may have been installed with a different binary name. Use "which" to find it, then call codepilot_cli_tools_add to register manually.`;
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : 'Command execution failed';
+    return `Installation failed: ${msg}`;
+  }
+}
+
 // ── Tool factory ─────────────────────────────────────────────────────
 
 /**
  * Create CLI tools as Vercel AI SDK ToolSet.
  * Can be used by both Native Runtime and as reference for SDK Runtime.
+ *
+ * codepilot_cli_tools_install carries no `execute` here — it is locked by
+ * agent-loop.ts (createAiSdkExecutionLock) immediately after tool
+ * assembly, and its real side effect (runCliToolInstall, above) is
+ * dispatched manually from there once prefix-safe-json's execution guard
+ * confirms authority. Every other tool below is unaffected.
  */
 export function createCliToolsTools() {
   return {
@@ -250,159 +439,15 @@ export function createCliToolsTools() {
     }),
 
     // ── INSTALL ──────────────────────────────────────────────────
-    codepilot_cli_tools_install: tool({
+    // No `execute`: locked by agent-loop.ts via createAiSdkExecutionLock
+    // immediately after tool assembly. The real side effect is
+    // runCliToolInstall (defined above createCliToolsTools in this file),
+    // dispatched manually only after prefix-safe-json's execution guard
+    // grants authority from raw streamed tool-input evidence.
+    codepilot_cli_tools_install: {
       description: 'Install a CLI tool by executing a shell command (e.g. "brew install ffmpeg", "pip install yt-dlp"). After the command succeeds, the tool is automatically detected and registered. This tool requires user permission before execution. After calling this tool, generate a bilingual description and call codepilot_cli_tools_add to save it.',
-      inputSchema: z.object({
-        command: z.string().describe('The install command to execute, e.g. "brew install ffmpeg"'),
-        name: z.string().optional().describe('Display name for the tool. If omitted, extracted from the command.'),
-      }),
-      execute: async ({ command, name }) => {
-        try {
-          const expandedPath = getExpandedPath();
-          const installMethod = extractInstallMethod(command);
-          const installPackage = extractPackageSpec(command);
-
-          const { stdout, stderr } = await execAsync(command, {
-            timeout: 300_000,
-            env: { ...process.env, PATH: expandedPath },
-          });
-
-          const output = (stdout + '\n' + stderr).trim();
-
-          // Build a list of binary name candidates to try with `which`.
-          // Package spec ≠ binary name, so we try multiple candidates:
-          //   "brew install ffmpeg" → ["ffmpeg"]
-          //   "npm install -g @elevenlabs/cli" → catalog binNames ["elevenlabs"], then ["cli"]
-          //   "brew install stripe/stripe-cli/stripe" → ["stripe"]
-          //   "npm install -g @music163/ncm-cli" → catalog binNames ["ncm-cli"]
-          const cmdParts = command.trim().split(/\s+/);
-          const binCandidates: string[] = [];
-          let rawPkgArg: string | null = null;
-          const installIdx = cmdParts.findIndex(p => p === 'install');
-          if (installIdx >= 0) {
-            for (let i = installIdx + 1; i < cmdParts.length; i++) {
-              if (!cmdParts[i].startsWith('-')) {
-                rawPkgArg = cmdParts[i].replace(/@[\d.]*$/, ''); // strip version pinning
-                break;
-              }
-            }
-          }
-
-          // Priority 1: check if a catalog tool matches this package — use its declared binNames
-          if (rawPkgArg) {
-            const matchingCatalog = CLI_TOOLS_CATALOG.find(c =>
-              c.installMethods.some(m => m.command.includes(rawPkgArg!))
-            );
-            if (matchingCatalog) {
-              binCandidates.push(...matchingCatalog.binNames);
-            }
-          }
-
-          // Priority 2: derive candidates from the package arg itself
-          if (rawPkgArg) {
-            const segments = rawPkgArg.split('/');
-            // Last segment (e.g. "stripe" from "stripe/stripe-cli/stripe", "ncm-cli" from "@music163/ncm-cli")
-            const last = segments[segments.length - 1];
-            if (last && !binCandidates.includes(last)) binCandidates.push(last);
-            // For scoped packages like @scope/name, also try "name" without scope
-            if (segments.length >= 2 && segments[0].startsWith('@')) {
-              const scopeless = segments[1];
-              if (scopeless && !binCandidates.includes(scopeless)) binCandidates.push(scopeless);
-            }
-          }
-
-          if (binCandidates.length === 0) {
-            return `Command executed successfully but could not determine the binary name.\nOutput:\n${output.slice(0, 1000)}\n\nPlease use codepilot_cli_tools_add with the binary path to register it manually.`;
-          }
-
-          invalidateDetectCache();
-
-          // Try each candidate with `which` until one resolves
-          let binPath: string | null = null;
-          let binName: string | null = null;
-          let version: string | null = null;
-          for (const candidate of binCandidates) {
-            try {
-              const { stdout: whichOut } = await execFileAsync('/usr/bin/which', [candidate], {
-                timeout: 5000,
-                env: { ...process.env, PATH: expandedPath },
-              });
-              const resolved = whichOut.trim().split(/\r?\n/)[0]?.trim();
-              if (resolved) {
-                binPath = resolved;
-                binName = candidate;
-                break;
-              }
-            } catch { /* try next candidate */ }
-          }
-
-          if (binPath) {
-            try {
-              const { stdout: vOut, stderr: vErr } = await execFileAsync(binPath, ['--version'], {
-                timeout: 5000,
-                env: { ...process.env, PATH: expandedPath },
-              });
-              const vText = (vOut || vErr).trim();
-              const match = vText.split('\n')[0]?.match(/(\d+\.\d+[\w.-]*)/);
-              version = match ? match[1] : null;
-            } catch { /* optional */ }
-
-            const toolName = name || binName || path.basename(binPath);
-            const registeredTool = createCustomCliTool({
-              name: toolName,
-              binPath,
-              binName: binName || path.basename(binPath),
-              version,
-              installMethod,
-              installPackage: installPackage || undefined,
-            });
-
-            const verStr = version ? ` v${version}` : '';
-            const resultLines = [
-              `Successfully installed and registered "${toolName}"${verStr}.`,
-              `Path: ${binPath}`,
-              `Tool ID: ${registeredTool.id}`,
-              `Install method: ${installMethod}`,
-            ];
-
-            // Check if this is a catalog tool that needs auth setup
-            const catalogDef = CLI_TOOLS_CATALOG.find(
-              c => c.binNames.includes(binName!) || c.id === binName
-            );
-            if (catalogDef?.setupType === 'needs_auth') {
-              resultLines.push('');
-              resultLines.push('\u26a0 This tool requires authentication before use:');
-              const steps = catalogDef.guideSteps.en;
-              // Skip the install step (usually first), show remaining setup steps
-              for (let i = 1; i < steps.length; i++) {
-                resultLines.push(`  ${i}. ${steps[i]}`);
-              }
-              resultLines.push('');
-              resultLines.push('Please guide the user through the authentication steps above.');
-            }
-
-            // Capture --help output so the model can generate an accurate description
-            const helpOutput = await getHelpOutput(binPath);
-            if (helpOutput) {
-              resultLines.push('');
-              resultLines.push('--- Tool Help Output ---');
-              resultLines.push(helpOutput);
-              resultLines.push('--- End Help Output ---');
-            }
-
-            resultLines.push('');
-            resultLines.push('Now please generate a bilingual description (zh/en) based on the help output above and call codepilot_cli_tools_add to save it.');
-
-            return resultLines.join('\n');
-          } else {
-            return `Command executed but could not locate "${binName}" in PATH after installation.\nOutput:\n${output.slice(0, 1000)}\n\nThe tool may have been installed with a different binary name. Use "which" to find it, then call codepilot_cli_tools_add to register manually.`;
-          }
-        } catch (error) {
-          const msg = error instanceof Error ? error.message : 'Command execution failed';
-          return `Installation failed: ${msg}`;
-        }
-      },
-    }),
+      inputSchema: CLI_TOOL_INSTALL_SCHEMA,
+    },
 
     // ── ADD ──────────────────────────────────────────────────────
     codepilot_cli_tools_add: tool({

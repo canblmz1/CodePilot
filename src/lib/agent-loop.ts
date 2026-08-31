@@ -34,6 +34,7 @@ import { wrapController } from './safe-stream';
 import { buildNativeErrorEventData } from './agent-loop-error-event';
 import { buildToolErrorResultData } from './agent-loop-tool-error';
 import { repairIncompleteToolHistory } from './tool-history-integrity';
+import { runCliToolInstall, CLI_TOOL_INSTALL_SCHEMA } from './builtin-tools/cli-tools';
 import {
   createNativeTimeoutController,
   resolveNativeTimeoutConfig,
@@ -288,6 +289,41 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
           });
           tools = assembled.tools;
           toolSystemPrompts = assembled.systemPrompts;
+        }
+
+        // Execution-integrity boundary for codepilot_cli_tools_install ONLY.
+        // This tool executes an arbitrary shell command built from
+        // model-generated text — the one tool in this set where "the model
+        // asked for it and the JSON parsed" is not sufficient proof of safe
+        // intent. An AI SDK provider adapter's separately-projected final
+        // tool-call input can diverge from what was actually streamed, even
+        // under a safe finish reason and even when the JSON is schema-valid
+        // (reproduced directly against the real @ai-sdk/openai adapter).
+        // createAiSdkExecutionLock removes execute/onInputStart/
+        // onInputDelta/onInputAvailable so nothing in this process can run
+        // it before the per-step guard below reaches a decision from raw
+        // streamed evidence. Every other tool in `tools` is unaffected —
+        // this branch only fires if the key is actually present (e.g. not
+        // mounted at all in a permission profile that excludes cli-tools).
+        if (tools.codepilot_cli_tools_install) {
+          // Dynamic import: prefix-safe-json is ESM-only; static import
+          // cannot be resolved from a .ts source file under this project's
+          // moduleResolution:"bundler" + tsx test harness combination. This
+          // runs once per agent-loop invocation, not per token.
+          const { createAiSdkExecutionLock } = await import('prefix-safe-json');
+          // `ToolSet`'s index signature widens every tool's own generic
+          // input-schema type to `FlexibleSchema<never>` for storage; the
+          // lock preserves the specific type it was actually given, which
+          // TypeScript can no longer prove satisfies that widened slot when
+          // merged back in — even though this is exactly the same tool
+          // object, unchanged in every field this cast doesn't touch.
+          // Runtime-correct, proven by the accompanying real-lifecycle
+          // tests (which import and execute this exact tool through this
+          // exact call), not a type suppressed to paper over a real gap.
+          const lockedInstallTool = createAiSdkExecutionLock({
+            codepilot_cli_tools_install: tools.codepilot_cli_tools_install,
+          }) as unknown as { codepilot_cli_tools_install: import('ai').ToolSet[string] };
+          tools = { ...tools, ...lockedInstallTool };
         }
 
         // Phase 5d Phase 2 P1 fix (2026-05-17) — augment system
@@ -584,6 +620,14 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
           // provider request (cleared by the fullStream observer below).
           timeoutCtl.onStepRequest();
 
+          // Fresh execution guard per step. Fed every fullStream event
+          // below (unfiltered — filtering evidence to make the guard
+          // approve would defeat the point) and resolved once this step's
+          // stream is fully consumed and finishReason is known. Only
+          // relevant to codepilot_cli_tools_install (the only locked
+          // tool); harmless no-op bookkeeping for every other event.
+          const stepGuard = (await import('prefix-safe-json')).createAiSdkExecutionGuard();
+
           // Call streamText (single step — we control the loop)
           const result = streamText({
             model: languageModel,
@@ -698,6 +742,7 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
             // Phase 4 ① — timeout observer: clears connect on start-step,
             // first-token on the first output part; tracks per-tool timers.
             timeoutCtl.onStreamPart(event as { type: string; toolCallId?: string });
+            stepGuard.push(event as never);
             switch (event.type) {
               case 'text-delta':
                 hasContent = true;
@@ -833,6 +878,85 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
           // Step's stream fully consumed — clear step-scoped timeout budgets.
           timeoutCtl.onStepEnd();
 
+          // Resolve authority for codepilot_cli_tools_install, if it was
+          // called this step. Every other tool already ran natively above
+          // (real execute(), real tool-result already in the fullStream) —
+          // this block only ever matches decisions for the one locked tool.
+          // Because the tool has no execute callback, a valid call cannot
+          // have produced a native SDK tool-result before this point —
+          // confirmed empirically, not assumed (see the accompanying
+          // research report). Fail closed: no authority, no dispatch.
+          const stepFinishReasonForGuard = await result.finishReason;
+          const { decisions: guardDecisions } = stepGuard.finish({
+            providerReason: String(stepFinishReasonForGuard),
+          });
+          const installResultMessages: ModelMessage[] = [];
+          for (const decision of guardDecisions) {
+            if (decision.name !== 'codepilot_cli_tools_install' || !decision.toolCallId) continue;
+            const toolCallId = decision.toolCallId;
+
+            let outcomeText: string;
+            let isError: boolean;
+            if (decision.action === 'execute') {
+              // Acquire authority only via takeDecision — one-shot, never
+              // decision.value read directly off the snapshot above (that
+              // snapshot is replayable diagnostic state, not authority).
+              const authority = stepGuard.takeDecision(decision.internalId);
+              if (!authority) {
+                // Unreachable in practice (nothing else could have consumed
+                // this internalId yet), kept as an explicit fail-closed
+                // branch rather than a non-null assertion.
+                outcomeText = 'Installation blocked: execution authority could not be acquired.';
+                isError = true;
+              } else {
+                const parsedInput = CLI_TOOL_INSTALL_SCHEMA.safeParse(authority.value);
+                if (!parsedInput.success) {
+                  // Should be unreachable — the guard's own schema
+                  // validation already required this shape — but never
+                  // trust authority.value into a shell command without
+                  // re-validating its own type here too.
+                  outcomeText = 'Installation blocked: the authorized value did not match the expected install-tool shape.';
+                  isError = true;
+                } else {
+                  // THE non-negotiable invariant: the command that reaches
+                  // the real shell execution function originates from
+                  // authority.value, never from an execute() argument,
+                  // step.toolCalls[].input/args, or SDK-projected input.
+                  outcomeText = await runCliToolInstall(parsedInput.data);
+                  isError = false;
+                }
+              }
+            } else {
+              // Rejected/no positive authority: append an explicit skipped
+              // tool-result rather than silently dropping it or aborting
+              // the whole step. Every tool_use requires a matching
+              // tool_result for the next model call's message history to
+              // remain valid (both OpenAI's and Anthropic's APIs reject a
+              // dangling tool_use) — and terminating the step outright
+              // would also discard any other tool calls or text the model
+              // produced in the same step. This mirrors how `tool-error`
+              // is already surfaced elsewhere in this same loop (line
+              // ~774 below): an is_error:true tool_result, not silence.
+              outcomeText = `Installation skipped: the surrounding response was not confirmed safe to execute (${decision.reason ?? 'no positive authority'}).`;
+              isError = true;
+            }
+
+            toolInvocationAccumulator.recordToolResult(toolCallId, outcomeText);
+            controller.enqueue(formatSSE({
+              type: 'tool_result',
+              data: JSON.stringify({ tool_use_id: toolCallId, content: outcomeText, is_error: isError }),
+            }));
+            installResultMessages.push({
+              role: 'tool',
+              content: [{
+                type: 'tool-result',
+                toolCallId,
+                toolName: 'codepilot_cli_tools_install',
+                output: { type: 'text', value: outcomeText },
+              }],
+            } as ModelMessage);
+          }
+
           // AI SDK's response metadata is the Runtime/Provider fact for the
           // model that actually answered. Keep the last step's value and
           // expose it in the terminal SSE result so managed Native Sub Agents
@@ -894,7 +1018,11 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
           // Update messages for next iteration.
           // streamText returns the full message list including our input + model response.
           // Use response.messages which contains properly typed ModelMessage[].
-          messages = [...messages, ...responseData.messages] as ModelMessage[];
+          // installResultMessages (built above) are appended after — the
+          // locked install tool has no native execute, so responseData.messages
+          // never contains a tool-result for it; this is where that missing
+          // message gets synthesized from scratch, not a placeholder-replace.
+          messages = [...messages, ...responseData.messages, ...installResultMessages] as ModelMessage[];
         }
 
         // 6a. Emit skill-nudge if the run was complex enough to warrant saving as a Skill.
