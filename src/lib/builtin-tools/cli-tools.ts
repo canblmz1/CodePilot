@@ -142,21 +142,94 @@ export const CLI_TOOL_INSTALL_SCHEMA = z.object({
 export type CliToolInstallInput = z.infer<typeof CLI_TOOL_INSTALL_SCHEMA>;
 
 /**
+ * Runs `command` with the same result shape as `execAsync(command,
+ * options)`, but with a real, empirically-verified process kill on abort.
+ *
+ * Measured directly on this project's Windows environment (2026-08-31):
+ * passing `signal` straight through to Node's own `child_process.exec`
+ * DOES reject the returned promise with a correct AbortError, but does
+ * NOT actually kill the real process. `exec()` on Windows runs the
+ * command via a `cmd.exe /c "<command>"` wrapper; Node's own
+ * signal-triggered kill only ever reaches that wrapper, and it reaps the
+ * wrapper before anything asks it to kill what IT spawned (e.g. the real
+ * `brew`/`npm`/`powershell` process) — that child is then orphaned and
+ * keeps running. Confirmed directly: a heartbeat file written by the
+ * "killed" process kept growing for seconds after its promise had
+ * already rejected.
+ *
+ * Fix, proven the same way: never hand `signal` to `exec()` itself. Take
+ * the real child handle synchronously, and on abort issue our own single
+ * `taskkill /pid <pid> /T /F` — `/T` kills the whole tree (the cmd.exe
+ * wrapper AND whatever it spawned) while the wrapper is still alive for
+ * `taskkill` to enumerate. That ordering is the actual bug: exec's own
+ * kill reaps the wrapper first, so a same-pid `/T` issued afterward has
+ * nothing left to walk ("process not found").
+ *
+ * On POSIX, `signal` is passed straight through to `exec()` — Node's
+ * standard, documented abort mechanism there sends a real OS signal to
+ * the shell-invoked command, which is not the Windows-specific wrapper
+ * failure measured above (not independently re-verified in this
+ * Windows-only environment, unlike the Windows path above).
+ */
+function execWithAbort(
+  command: string,
+  options: { timeout: number; env: NodeJS.ProcessEnv; signal?: AbortSignal },
+): Promise<{ stdout: string; stderr: string }> {
+  const { signal, ...execOptions } = options;
+  if (!signal || process.platform !== 'win32') {
+    return execAsync(command, options);
+  }
+  return new Promise((resolve, reject) => {
+    const child = exec(command, execOptions, (error, stdout, stderr) => {
+      if (error) {
+        Object.assign(error, { stdout, stderr });
+        reject(error);
+      } else {
+        resolve({ stdout, stderr });
+      }
+    });
+    const onAbort = () => {
+      const pid = child.pid;
+      if (pid != null) {
+        // Fire-and-forget: best-effort kill. A process that already
+        // exited on its own between the abort firing and this running
+        // must never block (or throw past) the rejection below.
+        execFile('taskkill', ['/pid', String(pid), '/T', '/F'], () => {});
+      }
+      const abortErr = new Error('The operation was aborted');
+      abortErr.name = 'AbortError';
+      Object.assign(abortErr, { code: 'ABORT_ERR' });
+      reject(abortErr);
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
  * The real side effect for codepilot_cli_tools_install: installs a CLI
  * tool by executing a shell command, then detects and registers the
  * resulting binary. Body unchanged from the tool's original execute()
- * callback — only hoisted out so it has exactly one caller-agnostic
- * implementation. Never throws; every failure path returns a message.
+ * callback except for the added `signal` plumbing — only hoisted out so
+ * it has exactly one caller-agnostic implementation. Never throws for an
+ * ordinary command failure (every such path returns a message) — the one
+ * exception is a `signal`-triggered abort, which propagates as a real
+ * thrown AbortError instead of a normal-looking result, so a caller
+ * racing this against a timeout/abort budget can tell the two apart.
  */
-export async function runCliToolInstall({ command, name }: CliToolInstallInput): Promise<string> {
+export async function runCliToolInstall(
+  { command, name }: CliToolInstallInput,
+  options?: { signal?: AbortSignal },
+): Promise<string> {
   try {
     const expandedPath = getExpandedPath();
     const installMethod = extractInstallMethod(command);
     const installPackage = extractPackageSpec(command);
 
-    const { stdout, stderr } = await execAsync(command, {
+    const { stdout, stderr } = await execWithAbort(command, {
       timeout: 300_000,
       env: { ...process.env, PATH: expandedPath },
+      signal: options?.signal,
     });
 
     const output = (stdout + '\n' + stderr).trim();
@@ -290,6 +363,14 @@ export async function runCliToolInstall({ command, name }: CliToolInstallInput):
       return `Command executed but could not locate "${binName}" in PATH after installation.\nOutput:\n${output.slice(0, 1000)}\n\nThe tool may have been installed with a different binary name. Use "which" to find it, then call codepilot_cli_tools_add to register manually.`;
     }
   } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      // A fired timeout budget or a caller abort killed the real process
+      // (execWithAbort above) — propagate so the caller's own timeout/
+      // abort classification runs, instead of reporting this as an
+      // ordinary installation failure while the run continues as if
+      // nothing happened.
+      throw error;
+    }
     const msg = error instanceof Error ? error.message : 'Command execution failed';
     return `Installation failed: ${msg}`;
   }

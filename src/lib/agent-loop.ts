@@ -886,9 +886,23 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
             }
           }
 
-          // Step's stream fully consumed — clear step-scoped timeout budgets.
-          timeoutCtl.onStepEnd();
-
+          // Step's stream is fully consumed, but timeoutCtl.onStepEnd() is
+          // deliberately NOT called yet: it unconditionally clears every
+          // per-tool timer, including the one armed for
+          // codepilot_cli_tools_install's own `tool-call` part above (see
+          // toolTimers in native-timeout.ts). That call's real work —
+          // authority, permission wait, shell execution — all happens
+          // below, AFTER the stream loop exits. Clearing here would let
+          // toolExecutionMs stop covering the one tool it names explicitly
+          // in its own semantic contract (native-timeout.ts's "for
+          // permission-gated tools the in-execute approval wait counts
+          // toward this budget"). onStepEnd() instead runs once, after
+          // every decision below has reached its own terminal outcome —
+          // each of which clears its OWN timer individually first (see
+          // the onStreamPart('tool-result') call in the loop below), so
+          // onStepEnd() here is just the same step-boundary safety net it
+          // always was, never the FIRST clear for this tool's timer.
+          //
           // Resolve authority for codepilot_cli_tools_install, if it was
           // called this step. Every other tool already ran natively above
           // (real execute(), real tool-result already in the fullStream) —
@@ -934,8 +948,15 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
                   // dispatch directly. THE non-negotiable invariant still
                   // holds: this value is authority.value, never an
                   // execute() argument, step.toolCalls[].input/args, or
-                  // SDK-projected input.
-                  outcomeText = await runCliToolInstall(parsedInput.data);
+                  // SDK-projected input. `signal: timeoutCtl.signal` is
+                  // the SAME combined signal (fired budget OR caller
+                  // abort) used everywhere else in this run — runCliToolInstall
+                  // throws a real AbortError instead of swallowing it if
+                  // this fires mid-execution, which propagates out of this
+                  // whole block uncaught, exactly like any other run
+                  // failure, so the outer catch's existing
+                  // timeoutCtl.fired-based classification runs unchanged.
+                  outcomeText = await runCliToolInstall(parsedInput.data, { signal: timeoutCtl.signal });
                   isError = false;
                 } else {
                   // codepilot_cli_tools_install is deliberately excluded
@@ -952,6 +973,31 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
                     parsedInput.data,
                     toolPermissionContext,
                   );
+                  // resolveToolPermission's own abort handling (shared
+                  // with every other tool's permission wait, via
+                  // permission-registry's registerPendingPermission)
+                  // RESOLVES as an ordinary deny when its abortSignal
+                  // fires — it never throws, by design, so every other
+                  // caller can keep treating "the wait was interrupted"
+                  // as a plain deny. That design is correct for
+                  // natively-executed tools (their OWN tool-result still
+                  // flows back through the fullStream, which guardStream
+                  // already races against a fired budget independently).
+                  // This manual path has no such independent race: past
+                  // this point nothing else is watching timeoutCtl.signal
+                  // for THIS call, so a deny caused by that same signal
+                  // having fired must be promoted to a real throw here —
+                  // never silently reported as an ordinary user denial
+                  // while the run continues to the next step as normal.
+                  if (timeoutCtl.signal.aborted) {
+                    const waitAbortErr = new Error(
+                      timeoutCtl.fired
+                        ? `Native timeout fired while waiting for permission on codepilot_cli_tools_install (${timeoutCtl.fired.reason})`
+                        : 'Permission wait for codepilot_cli_tools_install aborted',
+                    );
+                    waitAbortErr.name = 'AbortError';
+                    throw waitAbortErr;
+                  }
                   if (permission.action === 'deny') {
                     outcomeText = permission.message ?? 'Permission denied';
                     isError = true;
@@ -969,7 +1015,7 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
                       outcomeText = 'Installation blocked: the user-approved input did not match the expected install-tool shape.';
                       isError = true;
                     } else {
-                      outcomeText = await runCliToolInstall(revalidated.data);
+                      outcomeText = await runCliToolInstall(revalidated.data, { signal: timeoutCtl.signal });
                       isError = false;
                     }
                   }
@@ -990,6 +1036,19 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
               isError = true;
             }
 
+            // This decision has reached ITS OWN terminal outcome — success,
+            // permission deny, PSJ reject, or schema reject — so clear ITS
+            // toolCallId's own timer now, the same way a native tool's
+            // timer is cleared by its own real tool-result part on the
+            // stream above. onStreamPart keys strictly by toolCallId (see
+            // native-timeout.ts), so this can never clear a DIFFERENT
+            // decision's still-pending timer in the same step (two
+            // simultaneous installs stay independent). A signal-aborted
+            // runCliToolInstall/resolveToolPermission above already threw
+            // past this line entirely, so this only ever runs for a
+            // genuine terminal result, never papering over an abort.
+            timeoutCtl.onStreamPart({ type: 'tool-result', toolCallId });
+
             toolInvocationAccumulator.recordToolResult(toolCallId, outcomeText);
             controller.enqueue(formatSSE({
               type: 'tool_result',
@@ -1005,6 +1064,15 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
               }],
             } as ModelMessage);
           }
+
+          // Every decision above (if any) has now reached its own terminal
+          // outcome and cleared its own timer individually. This is the
+          // step-boundary safety net it always was — connect/first-token
+          // plus any tool timer that, for some other reason, never got an
+          // individual clear — never the FIRST clear for
+          // codepilot_cli_tools_install's timer (see the long comment
+          // where this call used to sit, right after the stream loop).
+          timeoutCtl.onStepEnd();
 
           // AI SDK's response metadata is the Runtime/Provider fact for the
           // model that actually answered. Keep the last step's value and
