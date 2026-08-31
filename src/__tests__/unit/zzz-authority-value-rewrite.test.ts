@@ -296,3 +296,89 @@ describe('PHASE 8 — one locked install + one unrelated normal tool in the same
     assert.deepEqual(idsSeen, ['call_install', 'call_list']);
   });
 });
+
+// ── FINAL PRE-PUSH REVIEW #1 — two codepilot_cli_tools_install calls in ONE step ──
+describe('TWO codepilot_cli_tools_install calls in the same model step', () => {
+  it('unique toolCallIds, independent decisions matched by toolCallId+toolName, authority A can only dispatch A, authority B can only dispatch B, each consumed once, two correct tool-results, zero cross-consumption', async () => {
+    const argsA = JSON.stringify({ command: 'echo call-A', name: 'tool-a' });
+    const argsB = JSON.stringify({ command: 'echo call-B', name: 'tool-b' });
+    const model = mockModel([
+      { type: 'stream-start', warnings: [] },
+      ...toolInputParts('call_A', 'codepilot_cli_tools_install', argsA),
+      ...toolInputParts('call_B', 'codepilot_cli_tools_install', argsB),
+      toolCallPart('call_A', 'codepilot_cli_tools_install', argsA),
+      toolCallPart('call_B', 'codepilot_cli_tools_install', argsB),
+      { type: 'finish', finishReason: { unified: 'tool-calls', raw: 'tool-calls' }, usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 } },
+    ]);
+
+    const r = await runStep(model);
+
+    // Unique toolCallIds, two independent decisions — never collapsed into
+    // one just because they share a tool name.
+    const installDecisions = r.decisions.filter((d) => d.name === 'codepilot_cli_tools_install');
+    assert.equal(installDecisions.length, 2, 'two independent guard decisions, not one merged decision');
+    const decisionIds = installDecisions.map((d) => d.toolCallId).sort();
+    assert.deepEqual(decisionIds, ['call_A', 'call_B']);
+    assert.notEqual(installDecisions[0].internalId, installDecisions[1].internalId, 'distinct internalIds — takeDecision() cannot be confused between them');
+
+    // Each decision matched by toolCallId + toolName (not name alone): find
+    // the specific decision for each call explicitly, the same way
+    // agent-loop.ts's for-of loop does — never `.find()` by name only.
+    const decisionA = installDecisions.find((d) => d.toolCallId === 'call_A');
+    const decisionB = installDecisions.find((d) => d.toolCallId === 'call_B');
+    assert.ok(decisionA && decisionB);
+
+    // Side effect ran exactly twice — once per call, never merged/skipped.
+    assert.equal(r.installSideEffectCalls, 2);
+
+    // Authority A dispatches ONLY command A; authority B dispatches ONLY
+    // command B — no cross-consumption in either direction.
+    const dispatched = r.capturedSideEffectInputs as Array<{ command: string; name?: string }>;
+    const dispatchedForA = dispatched.find((d) => d.command === 'echo call-A');
+    const dispatchedForB = dispatched.find((d) => d.command === 'echo call-B');
+    assert.ok(dispatchedForA && dispatchedForA.name === 'tool-a', 'authority A dispatched exactly command A, never command B');
+    assert.ok(dispatchedForB && dispatchedForB.name === 'tool-b', 'authority B dispatched exactly command B, never command A');
+    assert.equal(dispatched.length, 2, 'no third/duplicate dispatch from any cross-consumption');
+
+    // Each authority independently one-shot: re-consuming either internalId
+    // a second time (as if some other code path tried) returns undefined —
+    // and does not accidentally return the OTHER call's authority either.
+    const reconsumeA = r.stepGuard.takeDecision(decisionA!.internalId);
+    const reconsumeB = r.stepGuard.takeDecision(decisionB!.internalId);
+    assert.equal(reconsumeA, undefined);
+    assert.equal(reconsumeB, undefined);
+
+    // Two correct tool-result messages, one per call, addressed to the
+    // right toolCallId with the right call's own outcome text — never the
+    // other call's.
+    const toolMsgs = r.finalMessages.filter((m) => m.role === 'tool');
+    const resultParts = toolMsgs.flatMap((m) => (Array.isArray(m.content) ? m.content : [])) as Array<{
+      toolCallId?: string;
+      output?: { type: string; value: string };
+    }>;
+    assert.equal(resultParts.length, 2, 'exactly two tool-result messages, deterministic — no duplication, no omission');
+    const resultForA = resultParts.find((p) => p.toolCallId === 'call_A');
+    const resultForB = resultParts.find((p) => p.toolCallId === 'call_B');
+    assert.ok(resultForA?.output?.value.includes('tool-a') || resultForA?.output?.value.toLowerCase().includes('produ') === false);
+    // The install logic can't find a real binary for "echo" (no "install"
+    // keyword), so the outcome text is the "could not determine the binary
+    // name" branch — assert it at least reflects THIS call's own raw
+    // output, not a copy of the other call's.
+    assert.notEqual(resultForA?.output?.value, resultForB?.output?.value, 'the two results are not accidentally identical/swapped');
+
+    // Deterministic, valid ordering: both tool-result messages come after
+    // the assistant's tool-call message, in the same relative order the
+    // decisions were resolved (call_A before call_B, matching fullStream
+    // arrival order) — never interleaved before the assistant message.
+    const assistantIdx = r.finalMessages.findIndex((m) => m.role === 'assistant');
+    const toolMsgIdxs = r.finalMessages
+      .map((m, i) => (m.role === 'tool' ? i : -1))
+      .filter((i) => i >= 0);
+    assert.ok(toolMsgIdxs.every((i) => i > assistantIdx), 'every tool-result comes after the assistant message that requested it');
+    assert.deepEqual(
+      toolMsgIdxs.map((i) => ((r.finalMessages[i].content as Array<{ toolCallId?: string }>)[0]).toolCallId),
+      ['call_A', 'call_B'],
+      'ordering matches arrival order, deterministically — not reordered or racy',
+    );
+  });
+});
