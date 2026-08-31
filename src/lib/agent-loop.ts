@@ -14,7 +14,7 @@ import { streamText, type LanguageModel, type ToolSet, type ModelMessage } from 
 import type { SSEEvent, TokenUsage, MediaBlock, ExternalSource } from '@/types';
 import { subscribeBuiltinEvents } from './harness/builtin-event-bus';
 import { createModel } from './ai-provider';
-import { assembleTools, READ_ONLY_TOOLS } from './agent-tools';
+import { assembleTools, READ_ONLY_TOOLS, resolveToolPermission } from './agent-tools';
 import { reportNativeError } from './error-classifier';
 import { providerTelemetryIdentity, type ProviderTelemetryIdentity } from './telemetry/provider-failure';
 import { NativeStreamTelemetryState } from './telemetry/native-stream-boundary';
@@ -258,6 +258,25 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
         // When bypassPermissions is true (full_access profile), skip permission wrapping entirely.
         let tools: import('ai').ToolSet;
         let toolSystemPrompts: string[] = [];
+        // Captured so the manual-authority dispatch path below (for tools in
+        // MANUAL_AUTHORITY_TOOLS, e.g. codepilot_cli_tools_install) can reuse
+        // the EXACT SAME permission context resolveToolPermission() needs —
+        // not a reconstructed/duplicated one. undefined in bypass mode,
+        // matching assembleTools()'s own bypassPermissions handling exactly.
+        const toolPermissionContext = bypassPermissions ? undefined : {
+          sessionId,
+          permissionMode: (permissionMode || 'normal') as PermissionMode,
+          // Typed to the interface's own wider `{type: string; data:
+          // string}` shape (not narrowed to SSEEvent) — the cast happens
+          // at the enqueue boundary, same pattern the assembleTools()
+          // call below already used.
+          emitSSE: (event: { type: string; data: string }) => {
+            controller.enqueue(formatSSE(event as SSEEvent));
+          },
+          // Combined signal: user abort OR fired timeout budget — a
+          // timed-out run must also unblock any pending approval wait.
+          abortSignal: timeoutCtl.signal,
+        };
         if (toolsOverride) {
           tools = toolsOverride;
         } else {
@@ -276,16 +295,7 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
             callScene,
             grokVideoAvailable,
             bypassPermissions,
-            permissionContext: bypassPermissions ? undefined : {
-              sessionId,
-              permissionMode: (permissionMode || 'normal') as PermissionMode,
-              emitSSE: (event) => {
-                controller.enqueue(formatSSE(event as SSEEvent));
-              },
-              // Combined signal: user abort OR fired timeout budget — a
-              // timed-out run must also unblock any pending approval wait.
-              abortSignal: timeoutCtl.signal,
-            },
+            permissionContext: toolPermissionContext,
           });
           tools = assembled.tools;
           toolSystemPrompts = assembled.systemPrompts;
@@ -917,13 +927,51 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
                   // re-validating its own type here too.
                   outcomeText = 'Installation blocked: the authorized value did not match the expected install-tool shape.';
                   isError = true;
-                } else {
-                  // THE non-negotiable invariant: the command that reaches
-                  // the real shell execution function originates from
-                  // authority.value, never from an execute() argument,
-                  // step.toolCalls[].input/args, or SDK-projected input.
+                } else if (!toolPermissionContext) {
+                  // full_access / bypassPermissions: same as every other
+                  // tool under this profile — no permission prompt,
+                  // dispatch directly. THE non-negotiable invariant still
+                  // holds: this value is authority.value, never an
+                  // execute() argument, step.toolCalls[].input/args, or
+                  // SDK-projected input.
                   outcomeText = await runCliToolInstall(parsedInput.data);
                   isError = false;
+                } else {
+                  // codepilot_cli_tools_install is deliberately excluded
+                  // from wrapWithPermissions's generic execute-wrapping
+                  // (see MANUAL_AUTHORITY_TOOLS in agent-tools.ts) — it
+                  // has no execute() for that wrapper to wrap. The SAME
+                  // permission decision (checkPermission -> ask ->
+                  // allow/deny/updatedInput -> session approval) is made
+                  // here instead, via the identical resolveToolPermission()
+                  // the wrapper calls for every other mutating tool — one
+                  // implementation, two call sites, never duplicated.
+                  const permission = await resolveToolPermission(
+                    'codepilot_cli_tools_install',
+                    parsedInput.data,
+                    toolPermissionContext,
+                  );
+                  if (permission.action === 'deny') {
+                    outcomeText = permission.message ?? 'Permission denied';
+                    isError = true;
+                  } else {
+                    // permission.input equals authority.value UNLESS the
+                    // user explicitly edited it during approval
+                    // (updatedInput) — that explicit, human-approved edit
+                    // is the only way the dispatched value may ever differ
+                    // from authority.value. Re-validate with the same
+                    // schema PSJ's own authority already satisfied:
+                    // updatedInput arrives through a separate API/DB
+                    // boundary and must never reach the shell unchecked.
+                    const revalidated = CLI_TOOL_INSTALL_SCHEMA.safeParse(permission.input);
+                    if (!revalidated.success) {
+                      outcomeText = 'Installation blocked: the user-approved input did not match the expected install-tool shape.';
+                      isError = true;
+                    } else {
+                      outcomeText = await runCliToolInstall(revalidated.data);
+                      isError = false;
+                    }
+                  }
                 }
               }
             } else {
