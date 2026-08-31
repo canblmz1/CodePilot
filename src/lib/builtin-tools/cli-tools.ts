@@ -199,6 +199,10 @@ function execWithAbortWindows(
 ): Promise<{ stdout: string; stderr: string }> {
   const { signal, ...execOptions } = options;
   if (!signal) return execAsync(command, options);
+  // Defense-in-depth: runCliToolInstall already checks this before calling
+  // in, but this function must never spawn the real process on an
+  // already-fired signal regardless of caller discipline.
+  if (signal.aborted) return Promise.reject(makeAbortError());
   return new Promise((resolve, reject) => {
     let settled = false;
     const cleanup = () => signal.removeEventListener('abort', onAbort);
@@ -310,6 +314,10 @@ function execWithAbortPosix(
 ): Promise<{ stdout: string; stderr: string }> {
   const { signal, timeout, env } = options;
   if (!signal) return execAsync(command, options);
+  // Defense-in-depth: runCliToolInstall already checks this before calling
+  // in, but this function must never spawn the real process on an
+  // already-fired signal regardless of caller discipline.
+  if (signal.aborted) return Promise.reject(makeAbortError());
   return new Promise((resolve, reject) => {
     let settled = false;
     let stdout = '';
@@ -428,6 +436,11 @@ export async function runCliToolInstall(
   { command, name }: CliToolInstallInput,
   options?: { signal?: AbortSignal },
 ): Promise<string> {
+  // Primary guard: an already-aborted signal must never even start the
+  // real shell command — checked here, once, before anything else in
+  // this function runs (execWithAbort*'s own checks are defense-in-depth
+  // for this same invariant, not a substitute for it).
+  if (options?.signal?.aborted) throw makeAbortError();
   try {
     const expandedPath = getExpandedPath();
     const installMethod = extractInstallMethod(command);

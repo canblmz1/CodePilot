@@ -110,4 +110,36 @@ describe('abort-listener lifecycle', () => {
     const c2 = heartbeatCount(marker);
     assert.equal(c1, c2, `B's real process must actually be dead (c1=${c1}, c2=${c2}) — proves the abort correctly targeted B's own current pid, not a stale one left over from A`);
   });
+
+  it('a PRE-aborted signal rejects AbortError before any child process is created — cross-platform, no marker', async () => {
+    // execWithAbortWindows/execWithAbortPosix used to create the real
+    // child (exec()/spawn()) unconditionally, checking signal.aborted
+    // only afterward — an already-fired signal still started the real
+    // shell command, briefly, before being killed. This is the entry-
+    // point + defense-in-depth guard's own regression: reject before
+    // anything is ever spawned.
+    //
+    // Deliberately NOT the slow, looping heartbeatCommand used elsewhere
+    // in this file: confirmed directly that its own PowerShell/inner-
+    // worker startup latency is enough that even the OLD spawn-then-kill
+    // sequence (still fast: kill is issued synchronously right after
+    // spawn) never lets it reach its first write either — a false pass
+    // that would prove nothing. A single near-instant write has no such
+    // startup gap: confirmed directly that the OLD sequence DOES let it
+    // through (the marker exists) precisely because killing a real OS
+    // process is itself not instantaneous, while writing one line is.
+    const marker = nextMarker();
+    const quickMarkerCommand = process.platform === 'win32'
+      ? `cmd /c "echo x>${marker}"`
+      : `echo x > ${marker}`;
+    const ac = new AbortController();
+    ac.abort(); // aborted BEFORE runCliToolInstall is even called
+
+    await assert.rejects(
+      runCliToolInstall({ command: quickMarkerCommand, name: 'pre-aborted' }, { signal: ac.signal }),
+      (err: Error) => err.name === 'AbortError',
+    );
+    await sleep(400); // generous margin — the old sequence's marker would already exist well before this
+    assert.equal(fs.existsSync(marker), false, 'the marker file must never be created — nothing was ever spawned to create it');
+  });
 });
