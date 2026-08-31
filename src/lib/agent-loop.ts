@@ -724,6 +724,19 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
           let hasToolCalls = false;
           let hasContent = false; // tracks whether any actual content was produced
           const stepToolNames: string[] = [];
+          // Every codepilot_cli_tools_install toolCallId actually observed
+          // on the stream this step, independent of whether PSJ's guard
+          // ever produces a decision for it. A call with zero corroborating
+          // tool-input-delta evidence gets ZERO guard decisions (not even a
+          // 'reject' one — proven directly by the execution-authority
+          // suite's own CASE F), so the manual-dispatch loop below must
+          // reconcile against THIS set, not just iterate guardDecisions,
+          // or a no-evidence call silently gets no tool-result at all from
+          // this dispatch path — leaving its tool-call dangling until some
+          // later, generic repair mechanism papers over it, which is a
+          // different guarantee than the explicit fail-closed result this
+          // file's own dispatch is supposed to produce.
+          const observedInstallToolCallIds = new Set<string>();
           let externalSources: ExternalSource[] = [];
           const providerSearchResults = new Map<string, {
             content: string;
@@ -773,6 +786,9 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
                 else hasContent = true;
                 stepToolNames.push(event.toolName);
                 distinctTools.add(event.toolName);
+                if (event.toolName === 'codepilot_cli_tools_install' && event.toolCallId) {
+                  observedInstallToolCallIds.add(event.toolCallId);
+                }
                 // Phase 7 — accumulate for Context Accounting at result time.
                 toolInvocationAccumulator.recordToolUse(
                   event.toolCallId,
@@ -916,13 +932,31 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
             providerReason: String(stepFinishReasonForGuard),
           });
           const installResultMessages: ModelMessage[] = [];
-          for (const decision of guardDecisions) {
-            if (decision.name !== 'codepilot_cli_tools_install' || !decision.toolCallId) continue;
-            const toolCallId = decision.toolCallId;
+          // Reconcile against every OBSERVED install toolCallId (tracked
+          // above, from the raw stream), not just whatever guardDecisions
+          // happens to contain. A call with zero corroborating
+          // tool-input-delta evidence produces ZERO guard decisions — not
+          // even an explicit 'reject' one, proven directly by the
+          // execution-authority suite's own "no tool-input-delta evidence"
+          // case — so iterating guardDecisions alone would silently skip
+          // it: no tool-result from this dispatch path at all, leaving its
+          // tool-call dangling until some later, generic history-repair
+          // mechanism papers over it with a different, less specific
+          // message. Building this lookup once, then iterating the
+          // observed set, guarantees every install call this step reaches
+          // exactly one explicit outcome here — success, explicit reject,
+          // or explicit no-decision — never silence.
+          const installDecisionsById = new Map(
+            guardDecisions
+              .filter((d) => d.name === 'codepilot_cli_tools_install' && d.toolCallId)
+              .map((d) => [d.toolCallId as string, d]),
+          );
+          for (const toolCallId of observedInstallToolCallIds) {
+            const decision = installDecisionsById.get(toolCallId);
 
             let outcomeText: string;
             let isError: boolean;
-            if (decision.action === 'execute') {
+            if (decision && decision.action === 'execute') {
               // Acquire authority only via takeDecision — one-shot, never
               // decision.value read directly off the snapshot above (that
               // snapshot is replayable diagnostic state, not authority).
@@ -1021,8 +1055,8 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
                   }
                 }
               }
-            } else {
-              // Rejected/no positive authority: append an explicit skipped
+            } else if (decision) {
+              // An explicit reject decision: append an explicit skipped
               // tool-result rather than silently dropping it or aborting
               // the whole step. Every tool_use requires a matching
               // tool_result for the next model call's message history to
@@ -1033,6 +1067,17 @@ export function runAgentLoop(options: AgentLoopOptions): ReadableStream<string> 
               // is already surfaced elsewhere in this same loop (line
               // ~774 below): an is_error:true tool_result, not silence.
               outcomeText = `Installation skipped: the surrounding response was not confirmed safe to execute (${decision.reason ?? 'no positive authority'}).`;
+              isError = true;
+            } else {
+              // No decision at all — not even an explicit reject. This is
+              // the "no tool-input-delta evidence" case: the SDK still
+              // emitted a terminal tool-call part, but nothing corroborates
+              // it, so the guard never produces a decision to look up.
+              // Distinct message from the reject branch above (there's no
+              // decision.reason to report), but the same fail-closed
+              // guarantee: never falls back to the SDK-projected input,
+              // never silently drops the call.
+              outcomeText = 'Installation blocked: no execution-authority decision was ever produced for this call — no corroborating tool-input-delta evidence was observed on the stream.';
               isError = true;
             }
 

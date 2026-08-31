@@ -16,7 +16,7 @@
 
 import { tool } from 'ai';
 import { z } from 'zod';
-import { execFile, exec } from 'child_process';
+import { execFile, exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import { access, constants } from 'fs/promises';
 import path from 'path';
@@ -141,46 +141,60 @@ export const CLI_TOOL_INSTALL_SCHEMA = z.object({
 
 export type CliToolInstallInput = z.infer<typeof CLI_TOOL_INSTALL_SCHEMA>;
 
+/** Builds the AbortError shape both platform paths reject with on a real signal-triggered kill. */
+function makeAbortError(): NodeJS.ErrnoException {
+  const err = new Error('The operation was aborted') as NodeJS.ErrnoException;
+  err.name = 'AbortError';
+  err.code = 'ABORT_ERR';
+  return err;
+}
+
 /**
- * Runs `command` with the same result shape as `execAsync(command,
- * options)`, but with a real, empirically-verified process kill on abort.
+ * Windows path — proven necessary and sufficient by direct measurement on
+ * this project's environment (2026-08-31): passing `signal` straight
+ * through to Node's own `child_process.exec` DOES reject the returned
+ * promise with a correct AbortError, but does NOT actually kill the real
+ * process. `exec()` on Windows runs the command via a `cmd.exe /c
+ * "<command>"` wrapper; Node's own signal-triggered kill only ever
+ * reaches that wrapper, and it reaps the wrapper before anything asks it
+ * to kill what IT spawned (e.g. the real `brew`/`npm`/`powershell`
+ * process) — that child is then orphaned and keeps running. Confirmed
+ * directly: a heartbeat file written by the "killed" process kept
+ * growing for seconds after its promise had already rejected.
  *
- * Measured directly on this project's Windows environment (2026-08-31):
- * passing `signal` straight through to Node's own `child_process.exec`
- * DOES reject the returned promise with a correct AbortError, but does
- * NOT actually kill the real process. `exec()` on Windows runs the
- * command via a `cmd.exe /c "<command>"` wrapper; Node's own
- * signal-triggered kill only ever reaches that wrapper, and it reaps the
- * wrapper before anything asks it to kill what IT spawned (e.g. the real
- * `brew`/`npm`/`powershell` process) — that child is then orphaned and
- * keeps running. Confirmed directly: a heartbeat file written by the
- * "killed" process kept growing for seconds after its promise had
- * already rejected.
+ * Fix: never hand `signal` to `exec()` itself. Take the real child handle
+ * synchronously, and on abort issue our own single `taskkill /pid <pid>
+ * /T /F` — `/T` kills the whole tree (the cmd.exe wrapper AND whatever it
+ * spawned) while the wrapper is still alive for `taskkill` to enumerate.
+ * That ordering is the actual bug: exec's own kill reaps the wrapper
+ * first, so a same-pid `/T` issued afterward has nothing left to walk
+ * ("process not found").
  *
- * Fix, proven the same way: never hand `signal` to `exec()` itself. Take
- * the real child handle synchronously, and on abort issue our own single
- * `taskkill /pid <pid> /T /F` — `/T` kills the whole tree (the cmd.exe
- * wrapper AND whatever it spawned) while the wrapper is still alive for
- * `taskkill` to enumerate. That ordering is the actual bug: exec's own
- * kill reaps the wrapper first, so a same-pid `/T` issued afterward has
- * nothing left to walk ("process not found").
- *
- * On POSIX, `signal` is passed straight through to `exec()` — Node's
- * standard, documented abort mechanism there sends a real OS signal to
- * the shell-invoked command, which is not the Windows-specific wrapper
- * failure measured above (not independently re-verified in this
- * Windows-only environment, unlike the Windows path above).
+ * Listener lifecycle: `signal` is `timeoutCtl.signal` — a single,
+ * long-lived signal shared across every tool call in the whole run, not
+ * one scoped to this call. A `settled` flag plus `signal
+ * .removeEventListener` on every terminal path (success, ordinary
+ * failure, AND abort) is required so a call that finishes normally can
+ * never leave a stale listener attached — without it, a LATER abort
+ * elsewhere in the same run would still invoke this call's `onAbort`,
+ * `taskkill`-ing whatever process now happens to hold this call's
+ * long-exited, since-recycled PID. Confirmed directly: an unpatched
+ * version left the listener attached past a normal successful exit, and
+ * firing the same signal afterward still invoked the stale handler.
  */
-function execWithAbort(
+function execWithAbortWindows(
   command: string,
   options: { timeout: number; env: NodeJS.ProcessEnv; signal?: AbortSignal },
 ): Promise<{ stdout: string; stderr: string }> {
   const { signal, ...execOptions } = options;
-  if (!signal || process.platform !== 'win32') {
-    return execAsync(command, options);
-  }
+  if (!signal) return execAsync(command, options);
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
     const child = exec(command, execOptions, (error, stdout, stderr) => {
+      if (settled) return; // already handled via onAbort — a racing normal completion is a no-op
+      settled = true;
+      cleanup();
       if (error) {
         Object.assign(error, { stdout, stderr });
         reject(error);
@@ -188,7 +202,10 @@ function execWithAbort(
         resolve({ stdout, stderr });
       }
     });
-    const onAbort = () => {
+    function onAbort() {
+      if (settled) return; // child already completed on its own — never act on a stale/racing abort
+      settled = true;
+      cleanup();
       const pid = child.pid;
       if (pid != null) {
         // Fire-and-forget: best-effort kill. A process that already
@@ -196,14 +213,149 @@ function execWithAbort(
         // must never block (or throw past) the rejection below.
         execFile('taskkill', ['/pid', String(pid), '/T', '/F'], () => {});
       }
-      const abortErr = new Error('The operation was aborted');
-      abortErr.name = 'AbortError';
-      Object.assign(abortErr, { code: 'ABORT_ERR' });
-      reject(abortErr);
-    };
+      reject(makeAbortError());
+    }
     if (signal.aborted) onAbort();
     else signal.addEventListener('abort', onAbort, { once: true });
   });
+}
+
+/**
+ * POSIX path — `signal` passed straight through to `exec()` has the exact
+ * same class of bug already found on Windows, confirmed directly on real
+ * Linux (WSL2, kernel 6.6, 2026-08-31): the promise rejects correctly,
+ * but a plain (non-detached) grandchild the shell-invoked command itself
+ * forks — exactly what real install tooling does internally (npm/pip/
+ * build steps spawning their own worker subprocesses) — survives as an
+ * orphan. `sh -c "<command>"` execve-replacing itself into a SINGLE
+ * trailing command (no shell operators) is not the failure mode: killing
+ * that one PID does end a simple loop or a bare external binary. The
+ * failure is one level deeper — a child THAT command forks, which does
+ * not inherit any special relationship to `exec()`'s own signal handling
+ * and is not addressed by sending a signal to the immediate PID alone.
+ *
+ * Fix, verified the same way: spawn the command with `detached: true`
+ * (POSIX `setsid()` — the child becomes the leader of its own new process
+ * group) instead of via `exec()`'s own signal option, and on abort send
+ * the kill to the whole group via `process.kill(-pid, 'SIGKILL')` (a
+ * negative pid is POSIX's process-GROUP target, not a single process) —
+ * every descendant that didn't itself create a new group (the common
+ * case: a plain worker subprocess, not explicitly detached) dies with
+ * it. Confirmed directly with the same outer-tool-spawns-inner-worker
+ * shape: heartbeat stops growing immediately, not merely the promise
+ * rejecting.
+ *
+ * Two independent termination sources need two independent, correctly
+ * distinguished outcomes: a `signal`-triggered kill must produce an
+ * `AbortError` (so `runCliToolInstall` propagates it, matching the
+ * Windows path); the separate, pre-existing hardcoded `timeout` option
+ * must NOT — confirmed empirically that Node's own native `exec()`
+ * `timeout` firing produces a plain `Error` (`name: 'Error'`, `killed:
+ * true`, `signal: 'SIGTERM'`), never `AbortError` — so this manual
+ * POSIX implementation constructs the same non-`AbortError` shape for
+ * ITS OWN `timeout` firing, keeping that unrelated, pre-existing 300s
+ * ceiling's behavior (swallowed into an ordinary "Installation failed"
+ * message, run continues) unchanged from before any of this file's
+ * signal plumbing existed.
+ */
+/** Error shape for a POSIX command failure — deliberately separate from `NodeJS.ErrnoException` (whose `.code` is string-typed, for errno names, not exit codes). */
+interface ExecPosixFailure extends Error {
+  exitCode?: number;
+  signal?: string;
+  killed?: boolean;
+  stdout?: string;
+  stderr?: string;
+}
+
+function execWithAbortPosix(
+  command: string,
+  options: { timeout: number; env: NodeJS.ProcessEnv; signal?: AbortSignal },
+): Promise<{ stdout: string; stderr: string }> {
+  const { signal, timeout, env } = options;
+  if (!signal) return execAsync(command, options);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let stdout = '';
+    let stderr = '';
+    const child = spawn('sh', ['-c', command], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env,
+    });
+    child.stdout.on('data', (d: Buffer) => { stdout += d; });
+    child.stderr.on('data', (d: Buffer) => { stderr += d; });
+
+    const timeoutTimer = timeout > 0 ? setTimeout(() => killGroup(false), timeout) : null;
+    const cleanup = () => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      signal.removeEventListener('abort', onAbort);
+    };
+
+    child.on('exit', (exitCode, killedBySignal) => {
+      if (settled) return; // already handled via killGroup — a racing normal exit is a no-op
+      settled = true;
+      cleanup();
+      if (exitCode === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        const err = new Error(`Command failed: ${command}\n${stderr}`) as ExecPosixFailure;
+        err.exitCode = exitCode ?? undefined;
+        if (killedBySignal) err.signal = killedBySignal;
+        err.stdout = stdout;
+        err.stderr = stderr;
+        reject(err);
+      }
+    });
+    child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    });
+
+    function killGroup(isAbortSignal: boolean) {
+      if (settled) return; // child already completed on its own — never act on a stale/racing trigger
+      settled = true;
+      cleanup();
+      const pid = child.pid;
+      if (pid != null) {
+        // Negative pid = the whole process group, not just this one pid —
+        // required to reach a plain (non-detached) grandchild the
+        // command itself forked. Fire-and-forget: a group that already
+        // exited on its own must never block the rejection below.
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+      if (isAbortSignal) {
+        reject(makeAbortError());
+      } else {
+        // Mirrors Node's own native exec() timeout-error shape exactly
+        // (name: 'Error', killed: true, signal: 'SIGTERM') so this
+        // unrelated, pre-existing 300s ceiling's behavior is unchanged.
+        const err = new Error(`Command failed: ${command}`) as ExecPosixFailure;
+        err.killed = true;
+        err.signal = 'SIGTERM';
+        reject(err);
+      }
+    }
+    function onAbort() { killGroup(true); }
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
+ * Runs `command` with the same result shape as `execAsync(command,
+ * options)`, but with a real, empirically-verified process(-tree) kill on
+ * abort — see execWithAbortWindows / execWithAbortPosix for the
+ * platform-specific mechanism and the measurements behind each.
+ */
+function execWithAbort(
+  command: string,
+  options: { timeout: number; env: NodeJS.ProcessEnv; signal?: AbortSignal },
+): Promise<{ stdout: string; stderr: string }> {
+  return process.platform === 'win32'
+    ? execWithAbortWindows(command, options)
+    : execWithAbortPosix(command, options);
 }
 
 /**

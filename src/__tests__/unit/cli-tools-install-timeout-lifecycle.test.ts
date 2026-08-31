@@ -177,14 +177,54 @@ function toolResultFor(events: SSEEvent[], toolCallId: string): Record<string, u
 
 // ── Real child-process heartbeat: the only honest way to prove a process ──
 // was actually killed, not just that a promise rejected. Same technique
-// used to discover (and fix) the underlying bug empirically: a PowerShell
-// loop appends its counter to a marker file every ~150ms; if the file
-// stops growing shortly after the expected kill point, the real OS
-// process is dead — if it keeps growing, it's an orphan.
-
+// used to discover (and fix) the underlying bug empirically, on both
+// platforms this file actually runs against — not just Windows.
+//
+// Windows: a PowerShell loop appends its counter to a marker file every
+// ~150ms, run via the taskkill-tree mechanism execWithAbortWindows uses.
+//
+// POSIX: a plain `sh` loop would get execve-replaced into directly by
+// `sh -c "<command>"` (no separate descendant to leave orphaned), which
+// would pass even against a NAIVE, still-broken implementation and prove
+// nothing about the process-GROUP kill this file exists to verify. So the
+// POSIX heartbeat is structured the way this bug was actually found and
+// fixed: an outer `sh` command spawns a plain (non-detached) `node`
+// worker — the shape real install tooling (npm/pip/build steps) uses
+// internally — and the WORKER writes the heartbeat. Only a real
+// process-group kill (not a single-pid signal) reaches it.
 function heartbeatCommand(markerPath: string, iterations = 80): string {
-  const escaped = markerPath.replace(/'/g, "''");
-  return `powershell -NoProfile -Command "for ($i=0; $i -lt ${iterations}; $i++) { Add-Content -Path '${escaped}' -Value $i; Start-Sleep -Milliseconds 150 }"`;
+  if (process.platform === 'win32') {
+    const escaped = markerPath.replace(/'/g, "''");
+    return `powershell -NoProfile -Command "for ($i=0; $i -lt ${iterations}; $i++) { Add-Content -Path '${escaped}' -Value $i; Start-Sleep -Milliseconds 150 }"`;
+  }
+  // Two levels, deliberately: `sh -c "node <outerPath>"` is a single
+  // trailing command, so `sh` execve-replaces itself into that outer node
+  // process directly (same pid) — killing that one pid alone WOULD work,
+  // proving nothing about the group-kill fix. The outer script instead
+  // spawns a plain (non-detached) INNER worker and awaits it — the shape
+  // real install tooling (npm/pip/build steps) uses internally — and the
+  // inner worker is what actually writes the heartbeat. Only a real
+  // process-GROUP kill (not a single-pid signal to the outer process)
+  // reaches it.
+  const innerPath = markerPath.replace(/\.txt$/, '-inner.mjs');
+  const outerPath = markerPath.replace(/\.txt$/, '-outer.mjs');
+  fs.writeFileSync(
+    innerPath,
+    `import { appendFileSync } from 'node:fs';\n` +
+      `for (let i = 0; i < ${iterations}; i++) { appendFileSync(${JSON.stringify(markerPath)}, i + '\\n'); await new Promise((r) => setTimeout(r, 150)); }\n`,
+  );
+  fs.writeFileSync(
+    outerPath,
+    `import { spawn } from 'node:child_process';\n` +
+      `const child = spawn('node', [${JSON.stringify(innerPath)}], { stdio: 'ignore' });\n` +
+      `await new Promise((resolve) => child.on('exit', resolve));\n`,
+  );
+  return `node ${JSON.stringify(outerPath)}`;
+}
+
+/** A command that finishes almost immediately and echoes `text` to stdout — platform-neutral. */
+function quickCommand(text: string): string {
+  return process.platform === 'win32' ? `cmd /c "echo ${text}"` : `echo ${text}`;
 }
 
 function heartbeatCount(markerPath: string): number {
@@ -352,7 +392,7 @@ describe('TEST 7 — two same-step install calls', () => {
       timeouts: { toolExecutionMs: 500 },
       bypassPermissions: true,
       fetchHandler: () => toolStepResponse([
-        { id: 'toolu_t7a', name: 'codepilot_cli_tools_install', input: { command: 'cmd /c "echo quick-a"', name: 't7a' } },
+        { id: 'toolu_t7a', name: 'codepilot_cli_tools_install', input: { command: quickCommand('quick-a'), name: 't7a' } },
         { id: 'toolu_t7b', name: 'codepilot_cli_tools_install', input: { command: heartbeatCommand(markerB), name: 't7b' } },
       ]),
     });
@@ -378,7 +418,7 @@ describe('TEST 8 — default timeout config disabled', () => {
     const { events } = await runLoop({
       // No `timeouts` at all.
       bypassPermissions: true,
-      fetchHandler: () => toolStepResponse([{ id: 'toolu_t8', name: 'codepilot_cli_tools_install', input: { command: 'cmd /c "echo no-budget-configured"', name: 't8' } }]),
+      fetchHandler: () => toolStepResponse([{ id: 'toolu_t8', name: 'codepilot_cli_tools_install', input: { command: quickCommand('no-budget-configured'), name: 't8' } }]),
     });
     assert.equal(errorEventData(events), null, 'no timeout error with no budgets configured');
     const result = toolResultFor(events, 'toolu_t8');
